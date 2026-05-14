@@ -23,7 +23,7 @@ export const config = {
   heliusKey:     opt('HELIUS_API_KEY', ''),
   birdeyeKey:    opt('BIRDEYE_API_KEY', ''),
   llmBaseUrl:    opt('LLM_BASE_URL', 'https://openrouter.ai/api/v1'),
-  hunterModel:   opt('HUNTER_MODEL', 'anthropic/claude-sonnet-4.5'),
+  hunterModel:   opt('HUNTER_MODEL', 'anthropic/claude-sonnet-4.6'),
   healerModel:   opt('HEALER_MODEL', 'anthropic/claude-haiku-4.5'),
   lessonModel:   opt('LESSON_MODEL', 'anthropic/claude-haiku-4.5'),
 
