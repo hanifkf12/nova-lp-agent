@@ -15,13 +15,17 @@ export const config = {
   // Wallet
   walletPrivateKey: req('WALLET_PRIVATE_KEY'),
   rpcUrl: opt('SOLANA_RPC', 'https://api.mainnet-beta.solana.com'),
+  rpcFallbacks: opt('SOLANA_RPC_FALLBACKS', '')
+    .split(',').map(s => s.trim()).filter(Boolean),
 
   // APIs
   openrouterKey: req('OPENROUTER_API_KEY'),
   heliusKey:     opt('HELIUS_API_KEY', ''),
   birdeyeKey:    opt('BIRDEYE_API_KEY', ''),
-  llmModel:      opt('LLM_MODEL', 'openai/gpt-4o'),
   llmBaseUrl:    opt('LLM_BASE_URL', 'https://openrouter.ai/api/v1'),
+  hunterModel:   opt('HUNTER_MODEL', 'anthropic/claude-sonnet-4.5'),
+  healerModel:   opt('HEALER_MODEL', 'anthropic/claude-haiku-4.5'),
+  lessonModel:   opt('LESSON_MODEL', 'anthropic/claude-haiku-4.5'),
 
   // Telegram
   telegramToken:  req('TELEGRAM_BOT_TOKEN'),

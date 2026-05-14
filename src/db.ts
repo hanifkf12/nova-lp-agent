@@ -186,24 +186,21 @@ export function insertPosition(p: PositionInsert): number {
 export function closePosition(
   posId: number,
   params: {
-    feesSol:       number;
-    exitPrice:     number;
-    exitReason:    string;
-    feeApr:        number;
-    timeInRangePct: number;
+    feesSol:          number;   // total fees claimed in SOL
+    positionValueSol: number;   // final value of withdrawn tokens in SOL (just before close)
+    exitPrice:        number;
+    exitReason:       string;
+    feeApr:           number;
+    timeInRangePct:   number;
   }
-): void {
+): { pnlSol: number; pnlPct: number } {
   const pos = db.prepare('SELECT * FROM positions WHERE id = ?').get(posId) as any;
-  if (!pos) return;
+  if (!pos) return { pnlSol: 0, pnlPct: 0 };
 
-  // Impermanent loss: token half diverges from entry price
-  const tokenShare = (pos.sol_deployed ?? 0) * 0.5;
-  let ilSol = 0;
-  if (pos.entry_price > 0 && params.exitPrice > 0 && tokenShare > 0) {
-    ilSol = Math.abs(tokenShare * ((params.exitPrice - pos.entry_price) / pos.entry_price));
-  }
-
-  const pnlSol = params.feesSol - ilSol;
+  // True PnL = (final position value + fees) - deposited
+  // positionValueSol already accounts for IL because it's the live SOL-equivalent
+  // value of whatever mix of tokens the bins now hold.
+  const pnlSol = (params.positionValueSol + params.feesSol) - (pos.sol_deployed ?? 0);
   const pnlPct = pos.sol_deployed > 0 ? (pnlSol / pos.sol_deployed) * 100 : 0;
 
   db.prepare(`
@@ -218,8 +215,8 @@ export function closePosition(
     params.timeInRangePct, params.exitReason, posId
   );
 
-  // Update pool memory
   updatePoolMemory(pos.pool_address, pnlSol > 0);
+  return { pnlSol, pnlPct };
 }
 
 export function getOpenPositions(): any[] {
@@ -274,14 +271,28 @@ export function addLesson(role: string, content: string, source?: string, confid
   `).run(Date.now(), role, content, hash, source ?? null, confidence);
 }
 
+// Lessons decay: confidence multiplied by half-life of 60 days on read.
+// Lessons younger than ~60d are full weight; older ones fade out.
+const LESSON_HALF_LIFE_DAYS = 60;
+
 export function getLessons(role: string, limit = 10): string[] {
   const rows = db.prepare(`
-    SELECT content FROM lessons
+    SELECT content, confidence, created_at FROM lessons
     WHERE role = ? OR role = 'GENERAL'
-    ORDER BY confidence DESC, created_at DESC
-    LIMIT ?
-  `).all(role, limit) as any[];
-  return rows.map(r => r.content);
+  `).all(role) as any[];
+
+  const now = Date.now();
+  const scored = rows.map(r => {
+    const ageDays   = (now - r.created_at) / 86400000;
+    const decayed   = r.confidence * Math.pow(0.5, ageDays / LESSON_HALF_LIFE_DAYS);
+    return { content: r.content, weight: decayed };
+  });
+
+  return scored
+    .filter(s => s.weight > 0.05) // drop nearly-faded lessons
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, limit)
+    .map(s => s.content);
 }
 
 // ── Performance memory ─────────────────────────────────────────
