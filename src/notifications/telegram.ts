@@ -21,11 +21,11 @@ async function send(text: string): Promise<void> {
   }
 }
 
-function idr(sol: number): string {
-  // Approximate SOL price from state or default $220
-  const solPriceUsd = parseFloat(getState('sol_price_usd') ?? '220');
-  const usdVal = sol * solPriceUsd;
-  return Math.round(usdVal * config.usdToIdr).toLocaleString('id-ID');
+function usd(sol: number): string {
+  const solPriceUsd = parseFloat(getState('sol_price_usd') ?? '0');
+  if (!solPriceUsd) return '?';
+  const v = sol * solPriceUsd;
+  return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 // ── Alerts ─────────────────────────────────────────────────────
@@ -51,13 +51,12 @@ export async function alertDeploy(params: {
   feeTvlRatio:  number;
 }): Promise<void> {
   const p = params;
-  const solIdr = idr(p.solAmount);
 
   await send(
     `🟢 *LP DEPLOYED${config.dryRun ? ' [DRY]' : ''}*\n` +
     `Token    : ${p.symbol}\n` +
     `Strategy : ${p.strategy.toUpperCase()}\n` +
-    `Amount   : ${p.solAmount.toFixed(4)} SOL (Rp ${solIdr})\n` +
+    `Amount   : ${p.solAmount.toFixed(4)} SOL ($${usd(p.solAmount)})\n` +
     `Nova Score: ${p.novaScore.toFixed(1)}/100\n` +
     `Fee/TVL  : ${(p.feeTvlRatio * 100).toFixed(2)}%\n` +
     `Confidence: ${Math.round(p.confidence * 100)}%\n` +
@@ -77,13 +76,11 @@ export async function alertClose(params: {
   const p = params;
   const emoji   = p.feesSol >= 0 ? '✅' : '❌';
   const sign    = p.feesSol >= 0 ? '+' : '';
-  const feesIdr = idr(p.feesSol);
 
   await send(
     `${emoji} *LP CLOSED${config.dryRun ? ' [DRY]' : ''}*\n` +
     `Token    : ${p.symbol}\n` +
-    `Fees     : ${sign}${p.feesSol.toFixed(6)} SOL\n` +
-    `*${sign}Rp ${feesIdr}*\n` +
+    `Fees     : ${sign}${p.feesSol.toFixed(6)} SOL (${sign}$${usd(p.feesSol)})\n` +
     `PnL      : ${sign}${p.pnlPct.toFixed(2)}%\n` +
     `Fee APR  : ${p.feeApr.toFixed(1)}%\n` +
     `Duration : ${p.hoursOpen.toFixed(1)} jam\n` +
@@ -123,14 +120,14 @@ export async function sendDailyReport(): Promise<void> {
 
   const openPos  = getOpenPositions();
   const solBal   = parseFloat(getState('sol_balance') ?? '0');
-  const feesIdr  = idr(dayStats?.fees ?? 0);
-  const emoji    = (dayStats?.fees ?? 0) >= 0 ? '📈' : '📉';
+  const dayFees  = dayStats?.fees ?? 0;
+  const emoji    = dayFees >= 0 ? '📈' : '📉';
 
   await send(
     `${emoji} *Daily Report — ${today}*\n\n` +
     `*Hari ini:*\n` +
     `Closed  : ${dayStats?.total ?? 0} posisi (${dayStats?.wins ?? 0}W)\n` +
-    `Fees    : +${dayStats?.fees ?? 0} SOL (Rp ${feesIdr})\n` +
+    `Fees    : +${dayFees} SOL ($${usd(dayFees)})\n` +
     `Avg APR : ${dayStats?.avg_apr ?? 0}%\n\n` +
     `*All-time:*\n` +
     `Total   : ${perf.stats?.total ?? 0} | WR: ${perf.winRatePct}%\n` +

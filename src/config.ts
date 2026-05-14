@@ -68,6 +68,4 @@ export const config = {
   logLevel:  opt('LOG_LEVEL', 'info'),
   dbPath:    opt('DB_PATH', './data/nova.db'),
 
-  // Misc
-  usdToIdr: num('USD_TO_IDR', 15000),
 } as const;
