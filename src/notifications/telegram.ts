@@ -2,6 +2,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { db, getOpenPositions, buildPerformanceMemory, getState } from '../db';
+import { getLivePositionData } from '../execution/dlmm';
 
 let _bot: TelegramBot | null = null;
 
@@ -168,15 +169,49 @@ export function setupCommands(agentState: { isRunning: boolean }): void {
     if (!guard(msg)) return;
     const positions = getOpenPositions();
     if (positions.length === 0) {
-      await polBot.sendMessage(msg.chat.id, 'Tidak ada posisi terbuka.');
+      await polBot.sendMessage(msg.chat.id, 'No open positions.');
       return;
     }
-    const text = positions.map((p, i) =>
-      `${i+1}. ${p.token_symbol} [${p.strategy}]\n` +
-      `   Deployed: ${p.sol_deployed.toFixed(4)} SOL\n` +
-      `   Fees: ${p.fees_claimed_sol?.toFixed(6) ?? 0} SOL`
-    ).join('\n\n');
-    await polBot.sendMessage(msg.chat.id, `*Open Positions:*\n\n${text}`, { parse_mode: 'Markdown' });
+
+    const live = await Promise.all(positions.map(p =>
+      getLivePositionData(p.pool_address, p.position_pubkey ?? '', p.entry_price ?? 0, p.sol_deployed ?? 0)
+        .catch(() => null)
+    ));
+
+    const blocks = positions.map((p, i) => {
+      const ld           = live[i];
+      const hoursOpen    = (Date.now() - p.opened_at) / 3600000;
+      const claimedFees  = p.fees_claimed_sol ?? 0;
+      const pendingFees  = ld?.feesEarnedSol ?? 0;
+      const totalFees    = claimedFees + pendingFees;
+      const totalValue   = (ld?.positionValueSol ?? p.sol_deployed) + pendingFees;
+      const pnlPct       = p.sol_deployed > 0
+        ? ((totalValue - p.sol_deployed) / p.sol_deployed) * 100
+        : 0;
+      const sign         = pnlPct >= 0 ? '+' : '';
+      const rangeEmoji   = ld?.isInRange === false ? '⚠️ OOR' : ld?.isInRange ? '✅ in-range' : '❔ no data';
+      const currentPrice = ld?.currentPrice ?? p.entry_price ?? 0;
+      const priceMove    = p.entry_price > 0 ? ((currentPrice - p.entry_price) / p.entry_price) * 100 : 0;
+      const priceSign    = priceMove >= 0 ? '+' : '';
+
+      return (
+        `*${i + 1}. ${p.token_symbol}* [#${p.id}] _${p.strategy}_\n` +
+        `Status   : ${rangeEmoji} | ${hoursOpen.toFixed(1)}h open\n` +
+        `Deployed : ${p.sol_deployed.toFixed(4)} SOL\n` +
+        `Value    : ${totalValue.toFixed(4)} SOL (${sign}${pnlPct.toFixed(2)}%)\n` +
+        `Fees     : ${totalFees.toFixed(6)} SOL  (claimed ${claimedFees.toFixed(6)} + pending ${pendingFees.toFixed(6)})\n` +
+        `Entry    : ${(p.entry_price ?? 0).toPrecision(4)}\n` +
+        `Current  : ${currentPrice.toPrecision(4)} (${priceSign}${priceMove.toFixed(2)}%)\n` +
+        `Range    : ${(p.price_range_min ?? 0).toPrecision(4)} → ${(p.price_range_max ?? 0).toPrecision(4)}\n` +
+        `Pool     : \`${p.pool_address.slice(0, 16)}...\``
+      );
+    });
+
+    await polBot.sendMessage(
+      msg.chat.id,
+      `*Open Positions (${positions.length}):*\n\n${blocks.join('\n\n')}`,
+      { parse_mode: 'Markdown' }
+    );
   });
 
   polBot.onText(/\/stop/, async (msg) => {
