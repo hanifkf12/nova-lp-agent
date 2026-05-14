@@ -103,7 +103,8 @@ async function fetchMeteoraPools(http: typeof fetch): Promise<any[]> {
   const res  = await http(`${DISCOVERY_API}/pools?${params}`);
   if (!res.ok) throw new Error(`Meteora discovery API ${res.status}`);
   const data = await res.json() as any;
-  return Array.isArray(data) ? data : (data.pools ?? data.data ?? []);
+  const pools = Array.isArray(data) ? data : (data.pools ?? data.data ?? []);
+  return pools.filter((p: any) => p.pool_type === 'dlmm');
 }
 
 // ── Birdeye token enrichment ───────────────────────────────────
@@ -133,6 +134,31 @@ async function enrichWithBirdeye(http: typeof fetch, mint: string): Promise<{
 
 // ── Whale/KOL detection via Helius ────────────────────────────
 
+const decimalsCache = new Map<string, number>();
+
+async function getTokenDecimals(http: typeof fetch, mint: string): Promise<number> {
+  if (decimalsCache.has(mint)) return decimalsCache.get(mint)!;
+  if (!config.heliusKey) return 0;
+
+  try {
+    const res = await http(
+      `https://api.helius.xyz/v0/token-metadata?api-key=${config.heliusKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mintAccounts: [mint] }),
+      }
+    );
+    if (!res.ok) return 0;
+    const meta = (await res.json()) as any[];
+    const dec = meta[0]?.onChainMetadata?.metadata?.data?.decimals ?? 0;
+    decimalsCache.set(mint, dec);
+    return dec;
+  } catch {
+    return 0;
+  }
+}
+
 async function checkWhaleActivity(http: typeof fetch, mint: string): Promise<{
   whalePresent: boolean;
   kolPresent:   boolean;
@@ -141,23 +167,27 @@ async function checkWhaleActivity(http: typeof fetch, mint: string): Promise<{
   if (!config.heliusKey) return { whalePresent: false, kolPresent: false, bundlePct: 0 };
 
   try {
+    const decimals = await getTokenDecimals(http, mint);
+
     const res = await http(
       `https://api.helius.xyz/v0/addresses/${mint}/transactions?api-key=${config.heliusKey}&limit=20&type=SWAP`
     );
     if (!res.ok) return { whalePresent: false, kolPresent: false, bundlePct: 0 };
     const txs = await res.json() as any[];
 
-    // Heuristic: kalau ada transaksi > $5000 dalam 1 jam terakhir = whale
     const recentBig = txs.filter((tx: any) => {
       const age   = Date.now() - (tx.timestamp ?? 0) * 1000;
-      const value = (tx.tokenTransfers ?? []).reduce((s: number, t: any) =>
-        s + (t.tokenAmount ?? 0), 0);
-      return age < 3600000 && value > 100; // proxy
+      const value = (tx.tokenTransfers ?? []).reduce((s: number, t: any) => {
+        let amount = t.tokenAmount ?? 0;
+        if (decimals > 0) amount = amount / Math.pow(10, decimals);
+        return s + amount;
+      }, 0);
+      return age < 3600000 && value > 1; // > 1 token in last hour
     });
 
     return {
       whalePresent: recentBig.length > 2,
-      kolPresent:   false, // needs KOL list — can be extended
+      kolPresent:   false,
       bundlePct:    0,
     };
   } catch {
@@ -181,19 +211,27 @@ export async function huntPools(): Promise<PoolCandidate[]> {
   }
 
   logger.info(`Hunter: got ${raw.length} raw pools`);
-
-  // Filter cooldown dan blacklist
-  const filtered = raw.filter(p => {
-    const mint = p.base_mint ?? p.mint ?? p.token_mint;
-    return mint && !isPoolOnCooldown(p.address ?? p.pool_address);
+  if (raw.length > 0) logger.info('Sample:', { 
+    name: raw[0].name, 
+    tvl: raw[0].tvl, 
+    volume: raw[0].volume,
+    feeTvlRatio: raw[0].fee_tvl_ratio,
+    tokenX: raw[0].token_x?.symbol,
+    organicScore: raw[0].token_x?.organic_score,
+    holders: raw[0].base_token_holders,
   });
 
-  // Enrich top 15 pools secara paralel
+  const filtered = raw.filter(p => {
+    const mint = p.token_x?.address;
+    return mint && !isPoolOnCooldown(p.pool_address);
+  });
+  logger.info(`After cooldown filter: ${filtered.length}`);
+
   const top = filtered.slice(0, 15);
   const enriched = await Promise.all(top.map(async (p): Promise<PoolCandidate | null> => {
-    const mint    = p.base_mint ?? p.mint;
-    const symbol  = p.base_symbol ?? p.symbol ?? 'UNK';
-    const address = p.address ?? p.pool_address;
+    const mint    = p.token_x?.address;
+    const symbol  = p.token_x?.symbol ?? 'UNK';
+    const address = p.pool_address;
 
     if (!mint || !address) return null;
 
@@ -206,21 +244,21 @@ export async function huntPools(): Promise<PoolCandidate[]> {
       poolAddress:   address,
       tokenMint:     mint,
       tokenSymbol:   symbol,
-      binStep:       parseInt(p.bin_step ?? p.binStep ?? '100'),
-      tvlUsd:        parseFloat(p.tvl ?? p.liquidity ?? '0'),
-      volume24hUsd:  parseFloat(p.volume_24h ?? p.volume ?? '0'),
-      feeTvlRatio:   parseFloat(p.fee_tvl_ratio ?? p.feeTvlRatio ?? '0'),
-      organicScore:  parseFloat(p.organic_score ?? p.organicScore ?? '0'),
-      currentPrice:  parseFloat(p.price ?? '0'),
+      binStep:       parseInt(p.dlmm_params?.bin_step ?? '100'),
+      tvlUsd:        parseFloat(p.tvl ?? '0'),
+      volume24hUsd:  parseFloat(p.volume ?? '0'),
+      feeTvlRatio:   parseFloat(p.fee_tvl_ratio ?? '0'),
+      organicScore:  parseFloat(p.token_x?.organic_score ?? '0'),
+      currentPrice:  parseFloat(p.pool_price ?? '0'),
       priceChange24h: bird.priceChange24h,
-      holderCount:   bird.holderCount || parseInt(p.holder_count ?? '0'),
-      mcapUsd:       bird.mcapUsd    || parseFloat(p.market_cap ?? '0'),
+      holderCount:   bird.holderCount || parseInt(p.base_token_holders ?? p.token_x?.holders ?? '0'),
+      mcapUsd:       bird.mcapUsd    || parseFloat(p.token_x?.market_cap ?? '0'),
       bundlePct:     whale.bundlePct,
-      isWash:        !!(p.is_wash ?? p.wash_trading),
-      isRugpull:     !!(p.is_rugpull ?? p.rugpull),
+      isWash:        false,
+      isRugpull:     p.is_blacklisted ?? false,
       kolPresent:    whale.kolPresent,
       whalePresent:  whale.whalePresent,
-      deployerAddress: p.deployer ?? p.creator,
+      deployerAddress: '',
       novaScore:     0,
       riskLevel:     'MEDIUM',
       recommendation: '',

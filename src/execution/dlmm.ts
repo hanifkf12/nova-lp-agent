@@ -1,8 +1,8 @@
 import {
   Connection, Keypair, PublicKey,
-  sendAndConfirmTransaction, Transaction,
+  sendAndConfirmTransaction, SimulatedTransactionResponse,
 } from '@solana/web3.js';
-import DLMM, { StrategyType, LbPosition } from '@meteora-ag/dlmm';
+import DLMM, { StrategyType } from '@meteora-ag/dlmm';
 import BN from 'bn.js';
 import bs58 from 'bs58';
 import { config } from '../config';
@@ -29,10 +29,40 @@ export function getWallet(): Keypair {
 }
 
 export async function getSolBalance(): Promise<number> {
+  if (config.dryRun) return config.totalCapitalSol;
   const conn   = getConnection();
   const wallet = getWallet();
   const bal    = await conn.getBalance(wallet.publicKey);
   return bal / 1e9;
+}
+
+// ── Transaction simulation ─────────────────────────────────────
+
+async function simulate(conn: Connection, tx: any): Promise<SimulatedTransactionResponse | null> {
+  try {
+    const { value } = await conn.simulateTransaction(tx);
+    if (value.err) {
+      logger.warn('Tx simulation failed', { err: value.err });
+      return null;
+    }
+    logger.info('Tx simulation OK', { units: value.unitsConsumed ?? 'N/A' });
+    return value;
+  } catch {
+    logger.warn('Tx simulation error — proceeding anyway');
+    return null;
+  }
+}
+
+// ── DLMM instance cache ────────────────────────────────────────
+
+const dlmmCache = new Map<string, DLMM>();
+
+async function getDLMM(conn: Connection, poolPubkey: PublicKey): Promise<DLMM> {
+  const key = poolPubkey.toString();
+  if (!dlmmCache.has(key)) {
+    dlmmCache.set(key, await DLMM.create(conn, poolPubkey));
+  }
+  return dlmmCache.get(key)!;
 }
 
 // ── Strategy mapping ───────────────────────────────────────────
@@ -82,10 +112,11 @@ export async function deployPosition(
     const conn        = getConnection();
     const wallet      = getWallet();
     const poolPubkey  = new PublicKey(poolAddress);
-    const dlmmPool    = await DLMM.create(conn, poolPubkey);
+    const dlmmPool    = await getDLMM(conn, poolPubkey);
 
     const activeBin   = await dlmmPool.getActiveBin();
-    const entryPrice  = dlmmPool.fromPricePerLamport(Number(activeBin.price));
+    const entryPriceStr  = dlmmPool.fromPricePerLamport(Number(activeBin.price));
+    const entryPriceNum  = Number(entryPriceStr);
 
     // Calculate bin range
     const halfRange    = Math.floor(binRange / 2);
@@ -93,8 +124,8 @@ export async function deployPosition(
     const maxBinId     = activeBin.binId + halfRange;
 
     // Convert SOL to lamports
-    const totalXLamports = new BN(solAmount * 0.5 * 1e9); // split 50/50
-    const totalYLamports = new BN(solAmount * 0.5 * 1e9);
+    const totalXLamports = new BN(Math.floor(solAmount * 0.5 * 1e9)); // split 50/50
+    const totalYLamports = new BN(Math.floor(solAmount * 0.5 * 1e9));
 
     const strategyType = toStrategyType(strategy);
 
@@ -109,15 +140,23 @@ export async function deployPosition(
         minBinId,
         strategyType,
       },
-      slippage: 1,
+      slippage: config.slippageBps / 100,
     });
+
+    const sim = await simulate(conn, createTx);
+    if (!sim) {
+      logger.error('Deploy simulation failed, aborting');
+      return { success: false, error: 'Simulation failed' };
+    }
 
     const txSig = await sendAndConfirmTransaction(conn, createTx, [wallet, newPosition]);
 
     // Price range from bins
-    const priceRangeMin = dlmmPool.fromPricePerLamport(
-      Number(dlmmPool.getBinArrays().find(() => true)?.account?.bins?.[0]?.price ?? 0)
-    );
+    const binArrays = await dlmmPool.getBinArrays();
+    const firstBinPrice = binArrays.length > 0
+      ? Number(binArrays[0].account.bins[0]?.price ?? 0)
+      : 0;
+    const priceRangeMin = dlmmPool.fromPricePerLamport(firstBinPrice);
 
     logger.info('Position deployed', {
       poolAddress,
@@ -129,9 +168,9 @@ export async function deployPosition(
       success:        true,
       positionPubkey: newPosition.publicKey.toString(),
       txSignature:    txSig,
-      entryPrice,
-      priceRangeMin:  entryPrice * (1 - binRange * 0.001),
-      priceRangeMax:  entryPrice * (1 + binRange * 0.001),
+      entryPrice:     entryPriceNum,
+      priceRangeMin:  Number(priceRangeMin),
+      priceRangeMax:  Number(priceRangeMin),
       binCount:       binRange,
     };
 
@@ -158,8 +197,7 @@ export async function claimFees(
     const conn       = getConnection();
     const wallet     = getWallet();
     const poolPubkey = new PublicKey(poolAddress);
-    const dlmmPool   = await DLMM.create(conn, poolPubkey);
-    const posPubkey  = new PublicKey(positionPubkey);
+    const dlmmPool   = await getDLMM(conn, poolPubkey);
 
     const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
     const position = userPositions.find(p =>
@@ -168,17 +206,21 @@ export async function claimFees(
 
     if (!position) return { success: false, feesClaimedSol: 0 };
 
-    const claimTx = await dlmmPool.claimAllRewards({
+    const claimTxs = await dlmmPool.claimAllRewards({
       owner:    wallet.publicKey,
-      position: posPubkey,
+      positions: [position],
     });
 
-    await sendAndConfirmTransaction(conn, claimTx as Transaction, [wallet]);
+    for (const tx of claimTxs) {
+      const sim = await simulate(conn, tx);
+      if (!sim) continue;
+      await sendAndConfirmTransaction(conn, tx, [wallet]);
+    }
 
-    // Estimate fees from position data
     const feesX = Number(position.positionData.feeX) / 1e9;
     const feesY = Number(position.positionData.feeY) / 1e9;
 
+    logger.info('Fees claimed', { feesClaimedSol: feesX + feesY });
     return { success: true, feesClaimedSol: feesX + feesY };
   } catch (err) {
     logger.error('Claim fees failed', { err });
@@ -203,7 +245,7 @@ export async function closePosition(
     const conn       = getConnection();
     const wallet     = getWallet();
     const poolPubkey = new PublicKey(poolAddress);
-    const dlmmPool   = await DLMM.create(conn, poolPubkey);
+    const dlmmPool   = await getDLMM(conn, poolPubkey);
 
     const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
     const position = userPositions.find(p =>
@@ -216,15 +258,22 @@ export async function closePosition(
     const feesY = Number(position.positionData.feeY) / 1e9;
 
     const binIds = position.positionData.positionBinData.map((b: any) => b.binId);
-    const removeTx = await dlmmPool.removeLiquidity({
+    const fromBinId = Math.min(...binIds);
+    const toBinId = Math.max(...binIds);
+    const removeTxs = await dlmmPool.removeLiquidity({
       position: new PublicKey(positionPubkey),
       user:     wallet.publicKey,
-      binIds,
-      bpsToRemove: new BN(10000), // 100%
+      fromBinId,
+      toBinId,
+      bps: new BN(10000), // 100%
       shouldClaimAndClose: true,
     });
 
-    await sendAndConfirmTransaction(conn, removeTx as Transaction, [wallet]);
+    for (const tx of removeTxs) {
+      const sim = await simulate(conn, tx);
+      if (!sim) continue;
+      await sendAndConfirmTransaction(conn, tx, [wallet]);
+    }
 
     logger.info('Position closed', { poolAddress, positionPubkey });
     return { success: true, feesClaimedSol: feesX + feesY };
@@ -265,10 +314,10 @@ export async function getLivePositionData(
     const conn       = getConnection();
     const wallet     = getWallet();
     const poolPubkey = new PublicKey(poolAddress);
-    const dlmmPool   = await DLMM.create(conn, poolPubkey);
+    const dlmmPool   = await getDLMM(conn, poolPubkey);
 
     const activeBin  = await dlmmPool.getActiveBin();
-    const currentPrice = dlmmPool.fromPricePerLamport(Number(activeBin.price));
+    const currentPrice = Number(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
 
     const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
     const position = userPositions.find(p =>

@@ -17,10 +17,11 @@ export const config = {
   rpcUrl: opt('SOLANA_RPC', 'https://api.mainnet-beta.solana.com'),
 
   // APIs
-  anthropicKey:  req('ANTHROPIC_API_KEY'),
+  openrouterKey: req('OPENROUTER_API_KEY'),
   heliusKey:     opt('HELIUS_API_KEY', ''),
   birdeyeKey:    opt('BIRDEYE_API_KEY', ''),
-  llmModel:      opt('LLM_MODEL', 'claude-sonnet-4-20250514'),
+  llmModel:      opt('LLM_MODEL', 'openai/gpt-4o'),
+  llmBaseUrl:    opt('LLM_BASE_URL', 'https://openrouter.ai/api/v1'),
 
   // Telegram
   telegramToken:  req('TELEGRAM_BOT_TOKEN'),
@@ -56,9 +57,10 @@ export const config = {
   // Strategy
   lpStrategy: opt('LP_STRATEGY', 'auto') as LPStrategy,
   binRange:   parseInt(opt('BIN_RANGE', '69')),
+  slippageBps: parseInt(opt('SLIPPAGE_BPS', '200')),
 
   // Mode
-  dryRun:    opt('DRY_RUN', 'true') === 'true',
+  dryRun:    opt('DRY_RUN', '') === 'true',
   logLevel:  opt('LOG_LEVEL', 'info'),
   dbPath:    opt('DB_PATH', './data/nova.db'),
 

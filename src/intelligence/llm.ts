@@ -1,10 +1,7 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { config } from '../config';
 import { getLessons, buildPerformanceMemory } from '../db';
 import { PoolCandidate } from '../screening/hunter';
 import { logger } from '../utils/logger';
-
-const anthropic = new Anthropic({ apiKey: config.anthropicKey });
 
 export type AgentRole = 'HUNTER' | 'HEALER' | 'GENERAL';
 
@@ -26,38 +23,91 @@ export interface HealDecision {
   newStrategy?: string;
 }
 
-// ── HUNTER: apakah deploy di pool ini? ────────────────────────
+async function llmCall(prompt: string, maxTokens = 1200): Promise<string> {
+  const http = (await import('node-fetch')).default as unknown as typeof fetch;
+  const res = await http(`${config.llmBaseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${config.openrouterKey}`,
+      'HTTP-Referer': 'https://nova-lp-agent.local',
+      'X-Title': 'Nova LP Agent',
+    },
+    body: JSON.stringify({
+      model: config.llmModel,
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
 
-export async function askHunter(
-  candidate:   PoolCandidate,
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`${res.status} ${body}`);
+  }
+
+  const data = await res.json() as any;
+  return data.choices?.[0]?.message?.content ?? '';
+}
+
+function extractJson(raw: string): string {
+  let cleaned = raw.replace(/```json|```/g, '').trim();
+  const firstBracket = cleaned.indexOf('[');
+  const lastBracket = cleaned.lastIndexOf(']');
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (firstBracket !== -1 && lastBracket > firstBracket) {
+    cleaned = cleaned.slice(firstBracket, lastBracket + 1);
+  } else if (firstBrace !== -1 && lastBrace > firstBrace) {
+    cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+  }
+  return cleaned;
+}
+
+async function parseJSONWithRetry<T>(rawText: string, maxRetries = 2): Promise<T> {
+  let text = rawText;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return JSON.parse(extractJson(text)) as T;
+    } catch (firstErr) {
+      if (attempt === maxRetries) throw firstErr;
+      const fixPrompt = `You returned invalid JSON. Fix it so JSON.parse succeeds. Return ONLY valid JSON, no markdown, no explanation:\n\n${text}`;
+      text = await llmCall(fixPrompt, 400);
+    }
+  }
+  throw new Error('JSON parsing failed after retries');
+}
+
+export async function askHunterBatch(
+  candidates:  PoolCandidate[],
   openCount:   number,
   solBalance:  number,
-): Promise<DeployDecision> {
+): Promise<DeployDecision[]> {
 
   const lessons   = getLessons('HUNTER', 8);
   const perf      = buildPerformanceMemory();
 
+  const candidateBlocks = candidates.map((c, i) => `
+=== CANDIDATE ${i + 1} ===
+Symbol        : ${c.tokenSymbol}
+Nova Score    : ${c.novaScore.toFixed(1)}/100
+Risk Level    : ${c.riskLevel}
+Pool Address  : ${c.poolAddress}
+Fee/TVL Ratio : ${(c.feeTvlRatio * 100).toFixed(2)}% 
+Volume 24h    : $${c.volume24hUsd.toLocaleString()}
+TVL           : $${c.tvlUsd.toLocaleString()}
+Organic Score : ${c.organicScore.toFixed(0)}/100
+Holders       : ${c.holderCount.toLocaleString()}
+Market Cap    : $${c.mcapUsd.toLocaleString()}
+Bin Step      : ${c.binStep}
+Price Change 24h: ${c.priceChange24h.toFixed(2)}%
+Whale Present : ${c.whalePresent ? 'YES' : 'No'}
+KOL Present   : ${c.kolPresent ? 'YES' : 'No'}
+Bundle %      : ${c.bundlePct.toFixed(1)}%
+`).join('');
+
   const prompt = `
 Kamu adalah HUNTER agent yang mencari pool Meteora DLMM terbaik untuk LP.
-Putuskan apakah deploy likuiditas ke pool ini menguntungkan.
-
-=== POOL CANDIDATE ===
-Symbol        : ${candidate.tokenSymbol}
-Nova Score    : ${candidate.novaScore.toFixed(1)}/100
-Risk Level    : ${candidate.riskLevel}
-Pool Address  : ${candidate.poolAddress}
-
-Fee/TVL Ratio : ${(candidate.feeTvlRatio * 100).toFixed(2)}% 
-Volume 24h    : $${candidate.volume24hUsd.toLocaleString()}
-TVL           : $${candidate.tvlUsd.toLocaleString()}
-Organic Score : ${candidate.organicScore.toFixed(0)}/100
-Holders       : ${candidate.holderCount.toLocaleString()}
-Market Cap    : $${candidate.mcapUsd.toLocaleString()}
-Bin Step      : ${candidate.binStep}
-Price Change 24h: ${candidate.priceChange24h.toFixed(2)}%
-Whale Present : ${candidate.whalePresent ? 'YES' : 'No'}
-KOL Present   : ${candidate.kolPresent ? 'YES' : 'No'}
-Bundle %      : ${candidate.bundlePct.toFixed(1)}%
+Evaluasi ${candidates.length} kandidat pool dan putuskan untuk masing-masing apakah deploy likuiditas menguntungkan.
 
 === PORTFOLIO ===
 Open Positions: ${openCount}/${config.maxPositions}
@@ -84,39 +134,36 @@ ATURAN:
 - Risk HIGH → hanya deploy kalau confidence > 0.85
 - Max deploy = min(${config.maxPositionSol} SOL, 20% dari total capital)
 
-Respond HANYA JSON:
-{
-  "action": "DEPLOY" | "SKIP",
-  "strategy": "spot" | "curve" | "bid_ask",
-  "solAmount": number,
-  "binRange": number,
-  "confidence": 0.0-1.0,
-  "reasoning": "max 2 kalimat",
-  "learnedFrom": "lesson relevan atau null",
-  "warnings": ["warning1"]
-}`;
+${candidateBlocks}
 
-  const response = await anthropic.messages.create({
-    model:      config.llmModel,
-    max_tokens: 400,
-    messages:   [{ role: 'user', content: prompt }],
-  });
+Respond HANYA JSON array dengan ${candidates.length} entry:
+[
+  {
+    "action": "DEPLOY" | "SKIP",
+    "strategy": "spot" | "curve" | "bid_ask",
+    "solAmount": number,
+    "binRange": number,
+    "confidence": 0.0-1.0,
+    "reasoning": "max 2 kalimat",
+    "learnedFrom": "lesson relevan atau null",
+    "warnings": ["warning1"]
+  }
+]`;
 
-  const raw     = (response.content[0] as any).text as string;
-  const cleaned = raw.replace(/```json|```/g, '').trim();
-  const decision = JSON.parse(cleaned) as DeployDecision;
+  const raw = await llmCall(prompt, 1200);
+  const decisions = await parseJSONWithRetry<DeployDecision[]>(raw);
 
-  logger.info('Hunter LLM decision', {
-    symbol:     candidate.tokenSymbol,
-    action:     decision.action,
-    confidence: decision.confidence,
-    strategy:   decision.strategy,
-  });
+  for (let i = 0; i < decisions.length && i < candidates.length; i++) {
+    logger.info('Hunter LLM decision', {
+      symbol:     candidates[i].tokenSymbol,
+      action:     decisions[i].action,
+      confidence: decisions[i].confidence,
+      strategy:   decisions[i].strategy,
+    });
+  }
 
-  return decision;
+  return decisions;
 }
-
-// ── HEALER: apakah stay, close, atau redeploy? ─────────────────
 
 export async function askHealer(position: any, liveData: {
   currentPrice:  number;
@@ -176,26 +223,9 @@ Respond HANYA JSON:
   "newStrategy": "spot|curve|bid_ask jika REDEPLOY, else null"
 }`;
 
-  const response = await anthropic.messages.create({
-    model:      config.llmModel,
-    max_tokens: 300,
-    messages:   [{ role: 'user', content: prompt }],
-  });
-
-  const raw     = (response.content[0] as any).text as string;
-  const cleaned = raw.replace(/```json|```/g, '').trim();
-  const decision = JSON.parse(cleaned) as HealDecision;
-
-  logger.info('Healer LLM decision', {
-    symbol:  position.token_symbol,
-    action:  decision.action,
-    urgency: decision.urgency,
-  });
-
-  return decision;
+  const raw = await llmCall(prompt, 300);
+  return parseJSONWithRetry<HealDecision>(raw);
 }
-
-// ── Post-close: derive lessons ─────────────────────────────────
 
 export async function deriveLesson(position: any): Promise<string> {
   const prompt = `
@@ -215,11 +245,6 @@ Tulis SATU kalimat lesson yang actionable dan spesifik.
 Contoh format: "Kalau [kondisi X], maka [aksi Y] karena [alasan Z]"
 Respond HANYA dengan teks lesson, tanpa JSON atau format lain.`;
 
-  const response = await anthropic.messages.create({
-    model:      config.llmModel,
-    max_tokens: 150,
-    messages:   [{ role: 'user', content: prompt }],
-  });
-
-  return (response.content[0] as any).text.trim();
+  const raw = await llmCall(prompt, 150);
+  return raw.trim();
 }

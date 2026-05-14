@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { config } from './config';
 
 const dbDir = path.dirname(path.resolve(config.dbPath));
@@ -70,9 +71,19 @@ export function initDB(): void {
       created_at  INTEGER NOT NULL,
       role        TEXT NOT NULL,      -- HUNTER | HEALER | GENERAL
       content     TEXT NOT NULL,
+      content_hash TEXT NOT NULL,     -- SHA256 truncated for dedup
       source      TEXT,               -- position_id atau manual
       confidence  REAL DEFAULT 0.5,
       applies_to  TEXT                -- token_type, pool_type, dll
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_lessons_hash ON lessons(content_hash);
+
+    -- SOL price tracker for PnL calculation
+    CREATE TABLE IF NOT EXISTS sol_price_ticks (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp   INTEGER NOT NULL,
+      sol_price   REAL NOT NULL     -- SOL price in USD
     );
 
     -- Memory per pool — untuk cooldown dan history
@@ -185,9 +196,15 @@ export function closePosition(
   const pos = db.prepare('SELECT * FROM positions WHERE id = ?').get(posId) as any;
   if (!pos) return;
 
-  // PnL = fees earned - impermanent loss approximation
-  const pnlSol = params.feesSol; // simplified — IL calculated separately
-  const pnlPct = (pnlSol / pos.sol_deployed) * 100;
+  // Impermanent loss: token half diverges from entry price
+  const tokenShare = (pos.sol_deployed ?? 0) * 0.5;
+  let ilSol = 0;
+  if (pos.entry_price > 0 && params.exitPrice > 0 && tokenShare > 0) {
+    ilSol = Math.abs(tokenShare * ((params.exitPrice - pos.entry_price) / pos.entry_price));
+  }
+
+  const pnlSol = params.feesSol - ilSol;
+  const pnlPct = pos.sol_deployed > 0 ? (pnlSol / pos.sol_deployed) * 100 : 0;
 
   db.prepare(`
     UPDATE positions SET
@@ -248,10 +265,13 @@ export function isPoolOnCooldown(poolAddress: string): boolean {
 // ── Lessons ────────────────────────────────────────────────────
 
 export function addLesson(role: string, content: string, source?: string, confidence = 0.7): void {
+  const hash = crypto.createHash('sha256').update(content.trim()).digest('hex').slice(0, 16);
+  const existing = db.prepare('SELECT 1 FROM lessons WHERE content_hash = ?').get(hash);
+  if (existing) return; // dedup — skip identical lessons
   db.prepare(`
-    INSERT INTO lessons (created_at, role, content, source, confidence)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(Date.now(), role, content, source ?? null, confidence);
+    INSERT INTO lessons (created_at, role, content, content_hash, source, confidence)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(Date.now(), role, content, hash, source ?? null, confidence);
 }
 
 export function getLessons(role: string, limit = 10): string[] {
@@ -310,4 +330,28 @@ export function getState(k: string): string | null {
 }
 export function setState(k: string, v: string): void {
   db.prepare('INSERT OR REPLACE INTO agent_state (key,value) VALUES (?,?)').run(k, v);
+}
+
+// ── Incremental fee tracking ────────────────────────────────────
+
+export function addFeesClaimed(posId: number, sol: number): void {
+  db.prepare(`
+    UPDATE positions SET fees_claimed_sol = fees_claimed_sol + ? WHERE id = ?
+  `).run(sol, posId);
+}
+
+// ── SOL price tracking for PnL ──────────────────────────────────
+
+export function recordSolPrice(solPrice: number): void {
+  db.prepare('INSERT INTO sol_price_ticks (timestamp, sol_price) VALUES (?, ?)')
+    .run(Date.now(), solPrice);
+}
+
+export function getSolPriceAt(timestamp: number): number | null {
+  const tick = db.prepare(`
+    SELECT sol_price FROM sol_price_ticks
+    WHERE timestamp <= ?
+    ORDER BY timestamp DESC LIMIT 1
+  `).get(timestamp) as any;
+  return tick?.sol_price ?? null;
 }
