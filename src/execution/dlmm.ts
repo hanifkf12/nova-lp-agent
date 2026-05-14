@@ -7,7 +7,7 @@ import BN from 'bn.js';
 import bs58 from 'bs58';
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { db, getState, setState } from '../db';
+import { db, getState, setState, getOpenPositions, markPositionOrphan } from '../db';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -106,7 +106,7 @@ async function getDLMMReadOnly(poolAddress: string): Promise<{
   activeBinId:  number;
   binStep:      number;
 } | null> {
-  try {
+  const attempt = async () => {
     const conn       = getConnection();
     const poolPubkey = new PublicKey(poolAddress);
     const dlmmPool   = await getDLMM(conn, poolPubkey);
@@ -116,9 +116,19 @@ async function getDLMMReadOnly(poolAddress: string): Promise<{
     const binStep = Number((dlmmPool as any).lbPair?.binStep ?? 0);
     if (!Number.isFinite(currentPrice) || currentPrice <= 0 || binStep <= 0) return null;
     return { currentPrice, activeBinId, binStep };
+  };
+
+  try {
+    return await attempt();
   } catch (err) {
-    logger.warn('getDLMMReadOnly failed', { poolAddress, err: (err as Error).message });
-    return null;
+    logger.warn('getDLMMReadOnly failed, rotating RPC', { poolAddress, err: (err as Error).message });
+    rotateRpc();
+    try {
+      return await attempt();
+    } catch (err2) {
+      logger.warn('getDLMMReadOnly retry failed', { poolAddress, err: (err2 as Error).message });
+      return null;
+    }
   }
 }
 
@@ -563,8 +573,14 @@ export async function getLivePositionData(
     // IL: difference between current value and hypothetical "held SOL"
     const ilSol = Math.max(0, solDeployed - positionValueSol - feesEarnedSol);
 
-    // Fetch fresh pool stats
-    const stats = await fetchPoolStats(poolAddress);
+    // Entry-time snapshot for pool health. Meteora's discovery API does not
+    // support per-pool lookup (filter is silently ignored), so we surface the
+    // values screening already vetted. They drift over a position's lifetime
+    // but stay correctly attributed to THIS pool.
+    const snap = db.prepare(
+      `SELECT tvl_usd, volume_24h_usd, fee_tvl_ratio
+       FROM positions WHERE position_pubkey = ? AND status = 'open'`
+    ).get(positionPubkey) as any;
 
     return {
       isInRange,
@@ -572,9 +588,9 @@ export async function getLivePositionData(
       feesEarnedSol,
       positionValueSol,
       ilSol,
-      currentTvl:     stats?.tvl ?? 0,
-      currentVolume:  stats?.volume24h ?? 0,
-      feeTvlRatio:    stats?.feeTvlRatio ?? 0,
+      currentTvl:     snap?.tvl_usd        ?? 0,
+      currentVolume:  snap?.volume_24h_usd ?? 0,
+      feeTvlRatio:    snap?.fee_tvl_ratio  ?? 0,
     };
   } catch (err) {
     logger.warn('getLivePositionData failed', { err });
@@ -582,41 +598,58 @@ export async function getLivePositionData(
   }
 }
 
-// ── Pool stats from Meteora API ────────────────────────────────
+// ── Startup reconciliation ─────────────────────────────────────
+//
+// Boot-time check that every DB row with status='open' actually corresponds to
+// a live position on-chain. Catches drift from crashes during close, RPC errors
+// mid-tx, or manual DB edits. Orphans are removed from the open set so the
+// healer cycle won't try to operate on a ghost. Dry mode has nothing on-chain
+// to verify so this is a no-op there.
 
-interface PoolStats {
-  tvl:          number;
-  volume24h:    number;
-  feeTvlRatio:  number;
-  currentPrice: number;
-  binStep:      number;
-}
+export async function reconcileOpenPositions(): Promise<{
+  checked: number;
+  orphans: { id: number; symbol: string; reason: string }[];
+}> {
+  const open = getOpenPositions();
+  if (open.length === 0) return { checked: 0, orphans: [] };
 
-const statsCache = new Map<string, { at: number; data: PoolStats }>();
-const STATS_TTL_MS = 60 * 1000;
-
-async function fetchPoolStats(poolAddress: string): Promise<PoolStats | null> {
-  const cached = statsCache.get(poolAddress);
-  if (cached && Date.now() - cached.at < STATS_TTL_MS) return cached.data;
-
-  try {
-    const http = (await import('node-fetch')).default as unknown as typeof fetch;
-    const url  = `https://pool-discovery-api.datapi.meteora.ag/pools?pool_address=${poolAddress}&limit=1`;
-    const res  = await http(url);
-    if (!res.ok) return null;
-    const body = await res.json() as any;
-    const d    = (body?.data ?? [])[0];
-    if (!d) return null;
-    const stats: PoolStats = {
-      tvl:          parseFloat(d.tvl ?? '0'),
-      volume24h:    parseFloat(d.volume ?? '0'),
-      feeTvlRatio:  parseFloat(d.fee_tvl_ratio ?? '0'),  // percent (e.g., 8.09 = 8.09%/day)
-      currentPrice: parseFloat(d.pool_price ?? '0'),
-      binStep:      parseInt(d.dlmm_params?.bin_step ?? '0'),
-    };
-    statsCache.set(poolAddress, { at: Date.now(), data: stats });
-    return stats;
-  } catch {
-    return null;
+  if (config.dryRun) {
+    logger.info('Reconciliation skipped (dry mode — nothing on-chain to verify)', { open: open.length });
+    return { checked: open.length, orphans: [] };
   }
+
+  const conn   = getConnection();
+  const wallet = getWallet();
+  const orphans: { id: number; symbol: string; reason: string }[] = [];
+
+  // Group by pool to make one on-chain call per pool, not per position.
+  const byPool = new Map<string, any[]>();
+  for (const p of open) {
+    if (!byPool.has(p.pool_address)) byPool.set(p.pool_address, []);
+    byPool.get(p.pool_address)!.push(p);
+  }
+
+  for (const [poolAddress, rows] of byPool) {
+    let onchainKeys = new Set<string>();
+    try {
+      const dlmmPool = await getDLMM(conn, new PublicKey(poolAddress));
+      const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
+      onchainKeys = new Set(userPositions.map(p => p.publicKey.toString()));
+    } catch (err) {
+      logger.warn('Reconciliation: RPC failed for pool, skipping its positions', {
+        poolAddress, err: (err as Error).message,
+      });
+      continue;
+    }
+    for (const row of rows) {
+      const pk = row.position_pubkey ?? '';
+      if (!pk || !onchainKeys.has(pk)) {
+        markPositionOrphan(row.id, !pk ? 'missing pubkey' : 'not on-chain');
+        orphans.push({ id: row.id, symbol: row.token_symbol, reason: !pk ? 'missing pubkey' : 'not on-chain' });
+      }
+    }
+  }
+
+  return { checked: open.length, orphans };
 }
+

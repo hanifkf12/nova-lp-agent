@@ -225,6 +225,16 @@ export function getOpenPositions(): any[] {
   ).all() as any[];
 }
 
+// Mark a position as orphaned (DB says open but on-chain doesn't agree).
+// Healer won't pick it up anymore; manual inspection required.
+export function markPositionOrphan(posId: number, reason: string): void {
+  db.prepare(`
+    UPDATE positions
+    SET status = 'orphan', exit_reason = ?, closed_at = ?
+    WHERE id = ?
+  `).run(`orphan: ${reason}`, Date.now(), posId);
+}
+
 // ── Pool memory ────────────────────────────────────────────────
 
 export function updatePoolMemory(poolAddress: string, win: boolean): void {

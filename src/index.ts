@@ -13,7 +13,7 @@ import { askHunterBatch, askHealer, deriveLesson } from './intelligence/llm';
 import {
   getSolBalance, deployPosition, getConnection, rotateRpc,
   claimFees, closePosition as execClose,
-  getLivePositionData,
+  getLivePositionData, reconcileOpenPositions,
 } from './execution/dlmm';
 import {
   alertStarted, alertDeploy, alertClose,
@@ -384,6 +384,25 @@ async function main(): Promise<void> {
   if (!rpcOk) {
     logger.error('RPC unhealthy on all endpoints — refusing to start');
     process.exit(1);
+  }
+
+  const recon = await reconcileOpenPositions();
+  if (recon.orphans.length > 0) {
+    logger.warn('Reconciliation found orphan positions', { orphans: recon.orphans });
+    try {
+      const lines = recon.orphans.map(o => `• #${o.id} ${o.symbol} — ${o.reason}`).join('\n');
+      const TelegramBot = (await import('node-telegram-bot-api')).default;
+      const bot = new TelegramBot(config.telegramToken, { polling: false });
+      await bot.sendMessage(
+        config.telegramChatId,
+        `⚠️ *Reconciliation*\nFound ${recon.orphans.length} orphan position(s) at boot:\n${lines}\n\nMarked as \`orphan\` — manual review needed.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      logger.warn('Failed to send orphan alert', { err });
+    }
+  } else if (recon.checked > 0) {
+    logger.info('Reconciliation OK', { checked: recon.checked });
   }
 
   setupCommands(agentState);
