@@ -172,40 +172,40 @@ const healerTool: ToolDef = {
 // ── Static rule blocks (cacheable) ─────────────────────────────
 
 function hunterStaticRules(): string {
-  return `Kamu adalah HUNTER agent — mencari pool Meteora DLMM terbaik untuk LP single-sided.
+  return `You are the HUNTER agent — finding the best Meteora DLMM pools for single-sided LP.
 
-=== STRATEGI ===
-- SPOT: distribusi merata bin, cocok untuk trending market dengan momentum
-- CURVE: konsentrasi di harga sekarang, cocok untuk sideways tight, fee tertinggi tapi gampang out-of-range
-- BID_ASK: konsentrasi di edges, cocok untuk volatile / DCA pasif
+=== STRATEGIES ===
+- SPOT: uniform distribution across bins, good for trending markets with momentum
+- CURVE: concentrated at current price, good for tight sideways action, highest fees but easiest to go out-of-range
+- BID_ASK: concentrated at the edges, good for volatile pools / passive DCA
 
-=== ATURAN KETAT ===
-- Fee/TVL ratio < 5% → biasanya SKIP (fee inefficiency)
+=== HARD RULES ===
+- Fee/TVL ratio < 5% → usually SKIP (fee inefficiency)
 - Nova score < 50 → SKIP
-- Bundle % > 40% → SKIP (manipulasi supply)
-- Risk HIGH → hanya deploy kalau confidence > 0.85 dan ada lesson yang relevan
-- Max deploy per pos = min(${config.maxPositionSol} SOL, 20% dari total capital)
-- Pool fresh (volume tinggi, holder berkembang) preferred over stale pools
+- Bundle % > 40% → SKIP (supply manipulation)
+- Risk HIGH → only deploy if confidence > 0.85 and there's a relevant lesson
+- Max deploy per position = min(${config.maxPositionSol} SOL, 20% of total capital)
+- Prefer fresh pools (high volume, growing holders) over stale pools
 
-Output via tool call \`submit_deploy_decisions\`. Urutan decisions HARUS sesuai urutan CANDIDATE pada user message.`;
+Output via tool call \`submit_deploy_decisions\`. The order of decisions MUST match the order of CANDIDATE blocks in the user message.`;
 }
 
 function healerStaticRules(): string {
-  return `Kamu adalah HEALER agent — mengelola posisi LP aktif DLMM.
+  return `You are the HEALER agent — managing active DLMM LP positions.
 
-=== KEPUTUSAN ===
-- STAY: posisi sehat, biarkan continue earning
-- CLAIM_FEES: ambil fees yang sudah accrue tapi tetap hold posisi
-- CLOSE: tutup posisi (stop loss / take profit / pool death)
-- REDEPLOY: tutup lalu deploy ulang ke range baru (out of range terlalu lama)
+=== DECISIONS ===
+- STAY: position is healthy, let it keep earning
+- CLAIM_FEES: harvest accrued fees but keep holding the position
+- CLOSE: close the position (stop loss / take profit / pool death)
+- REDEPLOY: close and re-deploy to a new range (out of range for too long)
 
-=== ATURAN KETAT ===
-- PnL < -${(config.stopLossPct * 100).toFixed(0)}% (sudah include IL) → CLOSE (stop loss)
+=== HARD RULES ===
+- PnL < -${(config.stopLossPct * 100).toFixed(0)}% (includes IL) → CLOSE (stop loss)
 - PnL > +${(config.takeProfitPct * 100).toFixed(0)}% → CLOSE (take profit)
-- Out of range > 2 jam → REDEPLOY ke range baru sekitar harga sekarang
-- Fee/TVL ratio turun < 2% dan in-range → pertimbangkan CLOSE (pool dying)
-- Fees > 0.01 SOL terakumulasi dan in-range → CLAIM_FEES lalu STAY
-- Posisi < 1 jam — bias ke STAY kecuali stop-loss tertrigger
+- Out of range > 2 hours → REDEPLOY to a new range around the current price
+- Fee/TVL ratio dropped < 2% while in-range → consider CLOSE (pool dying)
+- Fees > 0.01 SOL accumulated and in-range → CLAIM_FEES then STAY
+- Position open < 1 hour → bias toward STAY unless stop-loss triggers
 
 Output via tool call \`submit_heal_decision\`.`;
 }
@@ -244,7 +244,7 @@ Recent:
 ${perf.recentTrades}
 
 === LESSONS FROM PAST TRADES ===
-${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'Belum ada lessons.'}
+${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'No lessons yet.'}
 
 ${candidates.map((c, i) => `
 === CANDIDATE ${i + 1} ===
@@ -320,27 +320,27 @@ export async function askHealer(position: any, liveData: {
     {
       type: 'text',
       text:
-`=== POSISI AKTIF ===
+`=== ACTIVE POSITION ===
 Token        : ${position.token_symbol}
 Pool         : ${position.pool_address}
 SOL deployed : ${position.sol_deployed} SOL
 Strategy     : ${position.strategy}
-Buka         : ${new Date(position.opened_at).toLocaleString('id-ID')}
-Durasi       : ${liveData.hoursOpen.toFixed(1)} jam
+Opened       : ${new Date(position.opened_at).toISOString()}
+Duration     : ${liveData.hoursOpen.toFixed(1)} hours
 
-=== STATUS LIVE ===
-In Range     : ${liveData.isInRange ? 'YES' : 'NO — tidak earning fee'}
+=== LIVE STATUS ===
+In Range     : ${liveData.isInRange ? 'YES' : 'NO — not earning fees'}
 PnL (incl IL): ${liveData.pnlPct.toFixed(2)}%
 Fees earned  : ${liveData.feesEarnedSol.toFixed(6)} SOL
 Current price: ${liveData.currentPrice.toFixed(8)}
 
 === POOL HEALTH ===
-TVL saat ini : $${liveData.currentTvl.toLocaleString()}
+Current TVL  : $${liveData.currentTvl.toLocaleString()}
 Volume 24h   : $${liveData.currentVolume.toLocaleString()}
 Fee/TVL ratio: ${(liveData.feeTvlRatio * 100).toFixed(2)}%
 
 === LESSONS ===
-${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'Belum ada lessons.'}`,
+${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'No lessons yet.'}`,
     },
   ];
 
@@ -368,15 +368,15 @@ export async function deriveLesson(position: any): Promise<string> {
     {
       type: 'text',
       text:
-`Kamu adalah lesson-distiller. Analisis SATU posisi LP yang sudah ditutup dan tulis SATU kalimat lesson yang actionable untuk agent di masa depan.
+`You are the lesson-distiller. Analyze ONE closed LP position and write ONE sentence of actionable guidance for the agent's future decisions.
 
-Format wajib: "Kalau [kondisi konkret], maka [aksi spesifik] karena [alasan/mekanisme]"
+Required format: "If [concrete condition], then [specific action] because [reason/mechanism]"
 
-Aturan:
-- 1 kalimat saja, max 200 karakter
-- Kondisi harus measurable (angka spesifik dari data, bukan vague)
-- Aksi harus actionable (DEPLOY/SKIP/CLOSE/REDEPLOY/sizing/strategi)
-- Tanpa preamble, tanpa quote, tanpa JSON — jawab dengan kalimat lesson langsung`,
+Rules:
+- One sentence only, max 200 characters
+- Condition must be measurable (specific numbers from the data, not vague)
+- Action must be actionable (DEPLOY/SKIP/CLOSE/REDEPLOY/sizing/strategy)
+- No preamble, no quotes, no JSON — reply with the lesson sentence directly`,
       cache_control: { type: 'ephemeral' },
     },
   ];
