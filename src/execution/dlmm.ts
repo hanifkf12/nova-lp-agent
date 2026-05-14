@@ -7,6 +7,7 @@ import BN from 'bn.js';
 import bs58 from 'bs58';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+import { db, getState, setState } from '../db';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -98,6 +99,29 @@ async function getDLMM(conn: Connection, poolPubkey: PublicKey): Promise<DLMM> {
   return dlmmCache.get(key)!;
 }
 
+// Read-only on-chain lookup for a pool's current price, active bin, bin step.
+// Used by dry-mode code paths since no HTTP endpoint reliably fetches a single pool.
+async function getDLMMReadOnly(poolAddress: string): Promise<{
+  currentPrice: number;
+  activeBinId:  number;
+  binStep:      number;
+} | null> {
+  try {
+    const conn       = getConnection();
+    const poolPubkey = new PublicKey(poolAddress);
+    const dlmmPool   = await getDLMM(conn, poolPubkey);
+    const activeBin  = await dlmmPool.getActiveBin();
+    const activeBinId = Number(activeBin.binId);
+    const currentPrice = Number(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
+    const binStep = Number((dlmmPool as any).lbPair?.binStep ?? 0);
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0 || binStep <= 0) return null;
+    return { currentPrice, activeBinId, binStep };
+  } catch (err) {
+    logger.warn('getDLMMReadOnly failed', { poolAddress, err: (err as Error).message });
+    return null;
+  }
+}
+
 // ── Pool token-side identification ─────────────────────────────
 
 interface PoolSides {
@@ -156,14 +180,28 @@ export async function deployPosition(
 ): Promise<DeployResult> {
 
   if (config.dryRun) {
-    logger.info('[DRY RUN] Would deploy position', { poolAddress, strategy, solAmount, binRange });
+    const onchain = await getDLMMReadOnly(poolAddress);
+    if (!onchain) {
+      logger.warn('[DRY RUN] deployPosition: on-chain read failed, skipping deploy', { poolAddress });
+      return { success: false, error: 'on-chain read failed' };
+    }
+    const { currentPrice: entryPrice, binStep } = onchain;
+    // Assume single-sided SOL = Y (SOL is quote, bins below active). Most memecoin/SOL pools.
+    // Range: [entryPrice / (1+binStep/10000)^(binRange-1), entryPrice]
+    const factor = Math.pow(1 + binStep / 10000, binRange - 1);
+    const priceRangeMin = entryPrice / factor;
+    const priceRangeMax = entryPrice;
+    logger.info('[DRY RUN] Would deploy position', {
+      poolAddress, strategy, solAmount, binRange, binStep,
+      entryPrice, priceRangeMin, priceRangeMax,
+    });
     return {
       success:        true,
       positionPubkey: `dry_${Date.now()}`,
       txSignature:    `dry_tx_${Date.now()}`,
-      entryPrice:     1.0,
-      priceRangeMin:  0.95,
-      priceRangeMax:  1.05,
+      entryPrice,
+      priceRangeMin,
+      priceRangeMax,
       binCount:       binRange,
     };
   }
@@ -270,9 +308,21 @@ export async function claimFees(
 ): Promise<{ success: boolean; feesClaimedSol: number; error?: string }> {
 
   if (config.dryRun) {
-    const simFees = Math.random() * 0.05;
-    logger.info('[DRY RUN] Would claim fees', { feesClaimedSol: simFees });
-    return { success: true, feesClaimedSol: simFees };
+    const pos = db.prepare(
+      `SELECT id FROM positions WHERE position_pubkey = ? AND status = 'open'`
+    ).get(positionPubkey) as any;
+    if (!pos) {
+      logger.warn('[DRY RUN] claimFees: no open position', { positionPubkey });
+      return { success: true, feesClaimedSol: 0 };
+    }
+    const stateKey = `dry_pos:${pos.id}`;
+    const raw = getState(stateKey);
+    const s = raw ? JSON.parse(raw) : { pendingFees: 0 };
+    const claimed = s.pendingFees ?? 0;
+    s.pendingFees = 0;
+    setState(stateKey, JSON.stringify(s));
+    logger.info('[DRY RUN] Would claim fees', { feesClaimedSol: claimed });
+    return { success: true, feesClaimedSol: claimed };
   }
 
   try {
@@ -317,9 +367,22 @@ export async function closePosition(
 ): Promise<{ success: boolean; feesClaimedSol: number; exitPrice: number; error?: string }> {
 
   if (config.dryRun) {
-    const simFees = Math.random() * 0.08;
-    logger.info('[DRY RUN] Would close position', { feesClaimedSol: simFees });
-    return { success: true, feesClaimedSol: simFees, exitPrice: 1.0 + (Math.random() - 0.5) * 0.1 };
+    const pos = db.prepare(
+      `SELECT id FROM positions WHERE position_pubkey = ? AND status = 'open'`
+    ).get(positionPubkey) as any;
+    const onchain = await getDLMMReadOnly(poolAddress);
+    const exitPrice = onchain?.currentPrice ?? 0;
+    if (!pos) {
+      logger.warn('[DRY RUN] closePosition: no open position', { positionPubkey });
+      return { success: true, feesClaimedSol: 0, exitPrice };
+    }
+    const stateKey = `dry_pos:${pos.id}`;
+    const raw = getState(stateKey);
+    const s = raw ? JSON.parse(raw) : { pendingFees: 0 };
+    const finalFees = s.pendingFees ?? 0;
+    db.prepare('DELETE FROM agent_state WHERE key = ?').run(stateKey);
+    logger.info('[DRY RUN] Would close position', { feesClaimedSol: finalFees, exitPrice });
+    return { success: true, feesClaimedSol: finalFees, exitPrice };
   }
 
   try {
@@ -385,17 +448,78 @@ export async function getLivePositionData(
 ): Promise<LivePositionData | null> {
 
   if (config.dryRun) {
-    const inRange = Math.random() > 0.2;
-    const fees    = Math.random() * 0.05;
+    const pos = db.prepare(
+      `SELECT id, opened_at, price_range_min, price_range_max,
+              tvl_usd, volume_24h_usd, fee_tvl_ratio
+       FROM positions WHERE position_pubkey = ? AND status = 'open'`
+    ).get(positionPubkey) as any;
+    if (!pos) {
+      logger.warn('[DRY RUN] getLivePositionData: no open position', { positionPubkey });
+      return null;
+    }
+    const onchain = await getDLMMReadOnly(poolAddress);
+    if (!onchain) {
+      logger.warn('[DRY RUN] getLivePositionData: on-chain price unavailable', { poolAddress });
+      return null;
+    }
+
+    const currentPrice  = onchain.currentPrice;
+    const priceRangeMin = pos.price_range_min ?? entryPrice * 0.95;
+    const priceRangeMax = pos.price_range_max ?? entryPrice * 1.05;
+    const midRange      = (priceRangeMin + priceRangeMax) / 2;
+    const isInRange     = currentPrice >= priceRangeMin && currentPrice <= priceRangeMax;
+    // Entry near top of range → SOL bins below active (solIsY); else above (solIsX).
+    const solBelow      = entryPrice >= midRange;
+
+    let positionValueSol: number;
+    if (isInRange) {
+      // Mild rebalance loss while in range (Uniswap-v2 IL formula as approximation)
+      const r  = entryPrice > 0 ? currentPrice / entryPrice : 1;
+      const il = r > 0 ? 2 * Math.sqrt(r) / (1 + r) - 1 : 0;   // ≤ 0
+      positionValueSol = solDeployed * (1 + il);
+    } else if (solBelow && currentPrice < priceRangeMin) {
+      // Price fell through SOL bins → all SOL converted to token at avg midRange
+      positionValueSol = solDeployed * (currentPrice / midRange);
+    } else if (!solBelow && currentPrice > priceRangeMax) {
+      // Price rose through SOL bins → all SOL converted to token at avg midRange
+      positionValueSol = solDeployed * (currentPrice / midRange);
+    } else {
+      // Out-of-range on the side that wasn't touched → SOL untouched, no IL, no fees
+      positionValueSol = solDeployed;
+    }
+    const ilSol = Math.max(0, solDeployed - positionValueSol);
+
+    // Stored snapshot (entry-time) for pool health — discovery API has no per-pool fetch.
+    const snapTvl    = pos.tvl_usd ?? 0;
+    const snapVolume = pos.volume_24h_usd ?? 0;
+    const snapFeeTvl = pos.fee_tvl_ratio ?? 0;
+
+    // Incremental fee accrual via persisted state
+    const stateKey = `dry_pos:${pos.id}`;
+    const rawState = getState(stateKey);
+    const state    = rawState
+      ? JSON.parse(rawState)
+      : { lastTickAt: pos.opened_at, pendingFees: 0 };
+    const now      = Date.now();
+    const deltaSec = Math.max(0, (now - state.lastTickAt) / 1000);
+    if (isInRange && snapFeeTvl > 0) {
+      // fee_tvl_ratio from discovery API is percent (e.g., 8.09 = 8.09%/day).
+      // Convert to fraction and clamp to a sane daily ceiling.
+      const dailyYield = Math.min(snapFeeTvl / 100, 0.5);
+      state.pendingFees += solDeployed * dailyYield * (deltaSec / 86400);
+    }
+    state.lastTickAt = now;
+    setState(stateKey, JSON.stringify(state));
+
     return {
-      isInRange:        inRange,
-      currentPrice:     1.0 + (Math.random() - 0.5) * 0.1,
-      feesEarnedSol:    fees,
-      positionValueSol: solDeployed * (0.95 + Math.random() * 0.1),
-      ilSol:            solDeployed * 0.02 * Math.random(),
-      currentTvl:       50000 + Math.random() * 50000,
-      currentVolume:    100000 + Math.random() * 100000,
-      feeTvlRatio:      0.05 + Math.random() * 0.1,
+      isInRange,
+      currentPrice,
+      feesEarnedSol:    state.pendingFees,
+      positionValueSol,
+      ilSol,
+      currentTvl:       snapTvl,
+      currentVolume:    snapVolume,
+      feeTvlRatio:      snapFeeTvl,
     };
   }
 
@@ -464,6 +588,8 @@ interface PoolStats {
   tvl:          number;
   volume24h:    number;
   feeTvlRatio:  number;
+  currentPrice: number;
+  binStep:      number;
 }
 
 const statsCache = new Map<string, { at: number; data: PoolStats }>();
@@ -475,13 +601,18 @@ async function fetchPoolStats(poolAddress: string): Promise<PoolStats | null> {
 
   try {
     const http = (await import('node-fetch')).default as unknown as typeof fetch;
-    const res = await http(`https://dlmm-api.meteora.ag/pair/${poolAddress}`);
+    const url  = `https://pool-discovery-api.datapi.meteora.ag/pools?pool_address=${poolAddress}&limit=1`;
+    const res  = await http(url);
     if (!res.ok) return null;
-    const d = await res.json() as any;
+    const body = await res.json() as any;
+    const d    = (body?.data ?? [])[0];
+    if (!d) return null;
     const stats: PoolStats = {
-      tvl:         parseFloat(d.liquidity ?? d.tvl ?? '0'),
-      volume24h:   parseFloat(d.trade_volume_24h ?? d.volume_24h ?? '0'),
-      feeTvlRatio: parseFloat(d.fee_tvl_ratio ?? d.fee_tvl_ratio_24h ?? '0'),
+      tvl:          parseFloat(d.tvl ?? '0'),
+      volume24h:    parseFloat(d.volume ?? '0'),
+      feeTvlRatio:  parseFloat(d.fee_tvl_ratio ?? '0'),  // percent (e.g., 8.09 = 8.09%/day)
+      currentPrice: parseFloat(d.pool_price ?? '0'),
+      binStep:      parseInt(d.dlmm_params?.bin_step ?? '0'),
     };
     statsCache.set(poolAddress, { at: Date.now(), data: stats });
     return stats;
