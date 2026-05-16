@@ -209,11 +209,13 @@ async function cmdBacktest(args: string[]): Promise<void> {
   }
 
   let symbol = '?';
+  let binStep = 25;
   if (!skipBackfill) {
     console.log(`Backfilling OHLCV for ${pool} (${days} days)...`);
     const r = await backfillFromOhlcv(pool, days);
-    symbol = r.symbol;
-    console.log(`  Inserted ${r.inserted} candles for ${symbol}.\n`);
+    symbol  = r.symbol;
+    binStep = r.binStep;
+    console.log(`  Inserted ${r.inserted} candles for ${symbol} (bin_step=${binStep}).\n`);
   }
 
   const since = Date.now() - days * 86400000;
@@ -222,9 +224,7 @@ async function cmdBacktest(args: string[]): Promise<void> {
     console.error('No snapshots in window. Run without --no-backfill first.');
     return;
   }
-
-  // Estimate bin step from any pool detail call could go here; fall back to a typical 25.
-  const binStep = 25;
+  if (snaps.length > 0 && symbol === '?') symbol = snaps[0].tokenSymbol;
 
   if (sweep) {
     console.log(`Sweeping score thresholds (40..95) on ${snaps.length} snapshots...\n`);
