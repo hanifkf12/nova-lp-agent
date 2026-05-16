@@ -86,11 +86,23 @@ async function llmCall(opts: LlmOptions): Promise<{
     if (opts.tools && opts.tools.length > 0) {
       body.tools = opts.tools;
       if (opts.toolChoice) {
-        body.tool_choice = isAnt
-          ? { type: 'tool_use', name: opts.toolChoice }
-          : { type: 'function', function: { name: opts.toolChoice } };
+        // OpenAI tool_choice shape — OpenRouter normalizes to each provider's
+        // native format. Avoids Bedrock's strict parser rejecting the
+        // Anthropic-native `type: 'tool'` form when OpenRouter doesn't
+        // translate it. (`type: 'tool_use'` was wrong outright — that's the
+        // response block type, not a request field.)
+        body.tool_choice = { type: 'function', function: { name: opts.toolChoice } };
       }
     }
+
+    // Force OpenRouter to pick a provider that actually supports the
+    // parameters we send (tools, tool_choice). Without this, Bedrock can
+    // be picked and reject the call. Also prefer Anthropic direct first
+    // for Claude models — it's most permissive on tool-use requests.
+    body.provider = {
+      require_parameters: true,
+      ...(isAnt ? { order: ['anthropic', 'amazon-bedrock'], allow_fallbacks: true } : {}),
+    };
 
     return body;
   };
@@ -249,6 +261,11 @@ REDEPLOY is expensive — every redeploy realizes IL plus pays slippage twice. U
 - Out of range more than 2 hours AND (PnL at or below -5 percent OR Fee/TVL at or below 8 percent) → CLOSE (do not redeploy a losing or dying pool — cut losses)
 - Pool already redeployed 1 or more times in last 24 hours → CLOSE rather than REDEPLOY again (the pool is churning — repeated redeploys compound IL)
 
+Realizable value vs mid-price PnL:
+- Two PnL numbers are shown: PnL at mid-price (optimistic) and PnL after close slippage (realistic)
+- If close slippage is above ${(config.maxCloseSlippagePct * 100).toFixed(0)} percent AND mid-price PnL is above the stop-loss threshold → STAY (selling now would crystallize MORE loss than the position is currently down — wait for liquidity to return)
+- For CLOSE / REDEPLOY decisions, weight the realistic PnL more than mid-price PnL
+
 Fee/TVL guidance (values are percent — compare directly, e.g. 76.89 means 76.89%):
 - Fee/TVL below 2 percent while in-range → consider CLOSE (pool dying)
 - Fee/TVL between 2 and 10 percent → acceptable but not great, STAY only if PnL positive
@@ -351,15 +368,25 @@ Bundle %       : ${c.bundlePct.toFixed(1)}%
 // ── HEALER ─────────────────────────────────────────────────────
 
 export async function askHealer(position: any, liveData: {
-  currentPrice:      number;
-  feesEarnedSol:     number;
-  isInRange:         boolean;
-  pnlPct:            number;
-  hoursOpen:         number;
-  currentTvl:        number;
-  currentVolume:     number;
-  feeTvlRatio:       number;
-  redeployCount24h?: number;
+  currentPrice:       number;
+  feesEarnedSol:      number;
+  isInRange:          boolean;
+  pnlPct:             number;
+  realizablePnlPct?:  number;
+  closeSlippagePct?:  number;
+  hoursOpen:          number;
+  currentTvl:         number;
+  currentVolume:      number;
+  feeTvlRatio:        number;
+  redeployCount24h?:  number;
+  poolDecay?: {
+    organicScoreEntry: number | null;
+    organicScoreNow:   number;
+    holdersEntry:      number | null;
+    holdersNow:        number;
+    feeTvlEntry:       number | null;
+    feeTvlNow:         number;
+  };
 }): Promise<HealDecision> {
 
   const lessons = getLessons('HEALER', 6);
@@ -381,17 +408,25 @@ Opened       : ${new Date(position.opened_at).toISOString()}
 Duration     : ${liveData.hoursOpen.toFixed(1)} hours
 
 === LIVE STATUS ===
-In Range     : ${liveData.isInRange ? 'YES' : 'NO — not earning fees'}
-PnL (incl IL): ${liveData.pnlPct.toFixed(2)}%
-Fees earned  : ${liveData.feesEarnedSol.toFixed(6)} SOL
-Current price: ${liveData.currentPrice.toFixed(8)}
+In Range          : ${liveData.isInRange ? 'YES' : 'NO — not earning fees'}
+PnL mid-price     : ${liveData.pnlPct.toFixed(2)} percent  (optimistic — assumes zero slippage on close)
+PnL realizable    : ${(liveData.realizablePnlPct ?? liveData.pnlPct).toFixed(2)} percent  (after swapping token side back to SOL)
+Close slippage    : ${(liveData.closeSlippagePct ?? 0).toFixed(2)} percent  (price impact of liquidating now)
+Fees earned       : ${liveData.feesEarnedSol.toFixed(6)} SOL
+Current price     : ${liveData.currentPrice.toFixed(8)}
 
 === POOL HEALTH ===
 Current TVL  : $${liveData.currentTvl.toLocaleString()}
 Volume 24h   : $${liveData.currentVolume.toLocaleString()}
 Fee/TVL ratio: ${(liveData.feeTvlRatio).toFixed(2)} percent
 Redeploys 24h: ${liveData.redeployCount24h ?? 0} (this pool, last 24 hours)
-
+${liveData.poolDecay ? `
+=== POOL DECAY (entry → now) ===
+Organic score: ${liveData.poolDecay.organicScoreEntry ?? '?'} → ${liveData.poolDecay.organicScoreNow.toFixed(0)}
+Holders      : ${liveData.poolDecay.holdersEntry ?? '?'} → ${liveData.poolDecay.holdersNow}
+Fee/TVL      : ${liveData.poolDecay.feeTvlEntry?.toFixed(2) ?? '?'} → ${liveData.poolDecay.feeTvlNow.toFixed(2)} percent
+(Significant decay = pool dying — bias toward CLOSE)
+` : ''}
 === LESSONS ===
 ${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'No lessons yet.'}`,
     },

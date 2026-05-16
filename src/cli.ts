@@ -4,11 +4,17 @@
 //   npm run stats      → show performance + recent closes
 //   npm run positions  → list open positions
 //   npm run lessons    → manage the lessons table (list / show / delete / prune)
+//   npm run backtest   → backfill OHLCV + run strategy backtest on a pool
 
 import { initDB, getOpenPositions, buildPerformanceMemory, db } from './db';
 import { huntPools } from './screening/hunter';
 import { logger } from './utils/logger';
 import { refreshSolPriceUsd } from './utils/solPrice';
+import { backfillFromOhlcv } from './backtest/ohlcv';
+import {
+  getSnapshots, runBacktest, optimizeScoreWeight, recordBacktestRun,
+} from './backtest/engine';
+import { config } from './config';
 
 async function cmdScreen(): Promise<void> {
   initDB();
@@ -182,18 +188,86 @@ function cmdLessons(args: string[]): void {
   );
 }
 
+function getArg(args: string[], name: string, fallback?: string): string | undefined {
+  const idx = args.findIndex(a => a === `--${name}`);
+  if (idx >= 0 && idx + 1 < args.length) return args[idx + 1];
+  return fallback;
+}
+
+async function cmdBacktest(args: string[]): Promise<void> {
+  initDB();
+  const pool   = getArg(args, 'pool');
+  const days   = Number(getArg(args, 'days', '14'));
+  const sol    = Number(getArg(args, 'sol',  String(config.maxPositionSol)));
+  const bins   = Number(getArg(args, 'bins', String(config.binRange)));
+  const sweep  = args.includes('--sweep');
+  const skipBackfill = args.includes('--no-backfill');
+
+  if (!pool) {
+    console.error('Usage: npm run backtest -- --pool <address> [--days 14] [--sol 0.4] [--bins 69] [--sweep] [--no-backfill]');
+    return;
+  }
+
+  let symbol = '?';
+  if (!skipBackfill) {
+    console.log(`Backfilling OHLCV for ${pool} (${days} days)...`);
+    const r = await backfillFromOhlcv(pool, days);
+    symbol = r.symbol;
+    console.log(`  Inserted ${r.inserted} candles for ${symbol}.\n`);
+  }
+
+  const since = Date.now() - days * 86400000;
+  const snaps = getSnapshots(pool, since, Date.now());
+  if (snaps.length === 0) {
+    console.error('No snapshots in window. Run without --no-backfill first.');
+    return;
+  }
+
+  // Estimate bin step from any pool detail call could go here; fall back to a typical 25.
+  const binStep = 25;
+
+  if (sweep) {
+    console.log(`Sweeping score thresholds (40..95) on ${snaps.length} snapshots...\n`);
+    const { bestThreshold, bestResult } = optimizeScoreWeight(snaps, {
+      solPerPosition: sol, binCount: bins, binStep,
+    });
+    console.log(`\nBest threshold: ${bestThreshold}`);
+    console.log(`  Positions  : ${bestResult.positions}`);
+    console.log(`  Win rate   : ${(bestResult.wins / Math.max(1, bestResult.positions) * 100).toFixed(1)}%`);
+    console.log(`  Total PnL  : ${bestResult.totalPnLSol.toFixed(4)} SOL`);
+    console.log(`  Avg APR    : ${bestResult.avgApr.toFixed(1)}%`);
+    console.log(`  Max DD     : ${(bestResult.maxDrawdown * 100).toFixed(1)}%`);
+    recordBacktestRun(bestResult);
+  } else {
+    const result = runBacktest(snaps, {
+      scoreThreshold: 65, solPerPosition: sol, binCount: bins, binStep,
+    });
+    console.log(`\n═══ Backtest: ${symbol} (${pool.slice(0, 8)}...) ═══`);
+    console.log(`Sample        : ${snaps.length} snapshots over ${days} days`);
+    console.log(`Positions     : ${result.positions}`);
+    console.log(`Wins / Losses : ${result.wins} / ${result.losses}`);
+    console.log(`Win rate      : ${(result.wins / Math.max(1, result.positions) * 100).toFixed(1)}%`);
+    console.log(`Total PnL SOL : ${result.totalPnLSol >= 0 ? '+' : ''}${result.totalPnLSol.toFixed(4)}`);
+    console.log(`Total fees    : ${result.totalFeesSol.toFixed(4)} SOL`);
+    console.log(`Avg APR       : ${result.avgApr.toFixed(1)}%`);
+    console.log(`Max drawdown  : ${(result.maxDrawdown * 100).toFixed(1)}%`);
+    recordBacktestRun(result);
+  }
+}
+
 const cmd = process.argv[2] ?? 'help';
 const rest = process.argv.slice(3);
 (async () => {
   try {
     switch (cmd) {
-      case 'screen':    await cmdScreen();    break;
-      case 'stats':     cmdStats();           break;
-      case 'positions': cmdPositions();       break;
-      case 'solprice':  await cmdSolPrice();  break;
-      case 'lessons':   cmdLessons(rest);     break;
+      case 'screen':    await cmdScreen();      break;
+      case 'stats':     cmdStats();             break;
+      case 'positions': cmdPositions();         break;
+      case 'solprice':  await cmdSolPrice();    break;
+      case 'lessons':   cmdLessons(rest);       break;
+      case 'backtest':  await cmdBacktest(rest); break;
       default:
-        console.log('Usage: ts-node src/cli.ts <screen|stats|positions|solprice|lessons>');
+        console.log('Usage: ts-node src/cli.ts <screen|stats|positions|solprice|lessons|backtest>');
     }
   } catch (err) {
     logger.error('CLI error', { err });

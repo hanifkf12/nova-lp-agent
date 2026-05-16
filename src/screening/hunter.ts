@@ -2,8 +2,39 @@ import { config } from '../config';
 import { isPoolOnCooldown } from '../db';
 import { logger } from '../utils/logger';
 
-const DISCOVERY_API = 'https://pool-discovery-api.datapi.meteora.ag';
+const DISCOVERY_API = config.meteoraDlmmApi;
 const BIRDEYE_API   = 'https://public-api.birdeye.so';
+
+// Per-pool detail refresh — used by the healer to detect decay (organic score
+// dropping, holders leaving, fee/TVL collapsing) without re-running the full
+// candidate-screening pipeline. One HTTP call per healer cycle per position;
+// well under the 30 RPS limit.
+export interface PoolDetail {
+  organicScore: number;
+  holderCount:  number;
+  tvlUsd:       number;
+  volume24hUsd: number;
+  feeTvlRatio:  number;
+}
+
+export async function fetchPoolDetail(poolAddress: string): Promise<PoolDetail | null> {
+  try {
+    const http = (await import('node-fetch')).default as unknown as typeof fetch;
+    const res = await http(`${DISCOVERY_API}/pools/${poolAddress}`);
+    if (!res.ok) return null;
+    const d = await res.json() as any;
+    return {
+      organicScore: parseFloat(d.token_x?.organic_score ?? d.organic_score ?? '0'),
+      holderCount:  parseInt(d.base_token_holders ?? d.token_x?.holders ?? '0'),
+      tvlUsd:       parseFloat(d.tvl ?? '0'),
+      volume24hUsd: parseFloat(d.volume ?? '0'),
+      feeTvlRatio:  parseFloat(d.fee_tvl_ratio ?? '0'),
+    };
+  } catch (err) {
+    logger.debug('fetchPoolDetail failed', { poolAddress, err: (err as Error).message });
+    return null;
+  }
+}
 
 export interface PoolCandidate {
   poolAddress:   string;

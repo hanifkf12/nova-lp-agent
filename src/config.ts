@@ -63,6 +63,14 @@ export const config = {
   binRange:   parseInt(opt('BIN_RANGE', '69')),
   slippageBps: parseInt(opt('SLIPPAGE_BPS', '200')),
 
+  // Healer guardrails
+  // If estimated close slippage exceeds this AND PnL is above stop-loss, prefer STAY —
+  // selling now would crystallize more loss than the position is currently down.
+  maxCloseSlippagePct: num('MAX_CLOSE_SLIPPAGE_PCT', 0.10),
+
+  // Meteora REST API (per-pool detail + OHLCV). Defaults to the discovery host.
+  meteoraDlmmApi: opt('METEORA_DLMM_API', 'https://pool-discovery-api.datapi.meteora.ag'),
+
   // Mode
   dryRun:    opt('DRY_RUN', '') === 'true',
   logLevel:  opt('LOG_LEVEL', 'info'),

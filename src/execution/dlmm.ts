@@ -188,12 +188,16 @@ export async function getLivePoolHealth(poolAddress: string): Promise<{
     const lbPair     = (dlmmPool as any).lbPair;
     if (!lbPair) return null;
 
-    const binStep      = Number(lbPair.binStep ?? 100);
-    const decimalsX    = (dlmmPool as any).tokenX?.decimal ?? (dlmmPool as any).tokenX?.mint?.decimals ?? 9;
-    const decimalsY    = (dlmmPool as any).tokenY?.decimal ?? (dlmmPool as any).tokenY?.mint?.decimals ?? 9;
-    const activeBin    = await dlmmPool.getActiveBin();
-    const activeBinId  = Number(activeBin.binId);
-    const currentPrice = safePriceFromLamport(dlmmPool, activeBin.price);
+    const binStep    = Number(lbPair.binStep ?? 100);
+    const decimalsX  = (dlmmPool as any).tokenX?.decimal ?? (dlmmPool as any).tokenX?.mint?.decimals ?? 9;
+    const decimalsY  = (dlmmPool as any).tokenY?.decimal ?? (dlmmPool as any).tokenY?.mint?.decimals ?? 9;
+
+    // SDK 1.9+ — supported API for ±N bins around the active bin.
+    // Replaces a manual loop that poked SDK internals via `as any`.
+    const { bins, activeBin: activeBinId } = await dlmmPool.getBinsAroundActiveBin(200, 200);
+
+    const activeBin    = bins.find(b => b.binId === activeBinId);
+    const currentPrice = activeBin ? safePriceFromLamport(dlmmPool, activeBin.price) : 0;
 
     let dynamicFee = 0;
     try {
@@ -204,27 +208,9 @@ export async function getLivePoolHealth(poolAddress: string): Promise<{
     }
 
     let totalX = new BN(0), totalY = new BN(0);
-    try {
-      for (let i = Math.max(0, activeBinId - 200); i <= activeBinId + 200; i++) {
-        const bin = (lbPair as any).bins?.get?.(i);
-        if (!bin) {
-          const binArr = await (lbPair as any).getBinArray?.(i);
-          if (!binArr || binArr.length === 0) continue;
-          for (const b of binArr) {
-            if (Number(b?.binId ?? -1) === i) {
-              totalX = totalX.add(new BN(b.amountX?.toString() ?? '0'));
-              totalY = totalY.add(new BN(b.amountY?.toString() ?? '0'));
-              break;
-            }
-          }
-        } else {
-          totalX = totalX.add(new BN(bin.amountX?.toString() ?? '0'));
-          totalY = totalY.add(new BN(bin.amountY?.toString() ?? '0'));
-        }
-      }
-    } catch {
-      // TVL approximation unavailable — return null for TVL
-      return { currentTvl: 0, currentFeeRate: dynamicFee, binStep };
+    for (const bin of bins) {
+      totalX = totalX.add(bin.xAmount);
+      totalY = totalY.add(bin.yAmount);
     }
 
     const xTokens = Number(new Decimal(totalX.toString()).div(Decimal.pow(10, decimalsX)));
@@ -290,6 +276,7 @@ export interface DeployResult {
   priceRangeMin?: number;
   priceRangeMax?: number;
   binCount?:      number;
+  rentSol?:       number;   // exact rent paid for position + bin arrays (live mode)
   error?:         string;
 }
 
@@ -362,17 +349,46 @@ export async function deployPosition(
     const totalXAmount = sides.solIsX ? solLamports : new BN(0);
     const totalYAmount = sides.solIsX ? new BN(0) : solLamports;
 
+    const strategyParams = {
+      maxBinId,
+      minBinId,
+      strategyType: toStrategyType(strategy),
+    };
+
+    // Exact rent quote — replaces the old hardcoded 0.005 SOL guess.
+    // Returns lamports for position account + bin array(s) + bitmap extension.
+    let rentSol = 0;
+    try {
+      const q = await dlmmPool.quoteCreatePosition({ strategy: strategyParams });
+      rentSol = (q.positionCost + q.positionReallocCost + q.bitmapExtensionCost + q.binArrayCost) / 1e9;
+      const balanceLamports = await conn.getBalance(wallet.publicKey);
+      const required = solLamports.toNumber() + rentSol * 1e9 + 5_000_000; // +0.005 SOL fee buffer
+      if (balanceLamports < required) {
+        return {
+          success: false,
+          error: `Insufficient SOL: have ${(balanceLamports / 1e9).toFixed(4)}, need ${(required / 1e9).toFixed(4)} (deploy ${solAmount} + rent ${rentSol.toFixed(4)} + fee buffer)`,
+        };
+      }
+      logger.info('Position rent quoted', {
+        rentSol: rentSol.toFixed(6),
+        binArrays: q.binArraysCount,
+        positionCount: q.positionCount,
+        txCount: q.transactionCount,
+      });
+    } catch (err) {
+      logger.warn('quoteCreatePosition failed, proceeding with conservative estimate', {
+        err: (err as Error).message,
+      });
+      rentSol = 0.06; // conservative fallback if quote API fails
+    }
+
     const newPosition = Keypair.generate();
     const createRaw = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
       positionPubKey: newPosition.publicKey,
       user:           wallet.publicKey,
       totalXAmount,
       totalYAmount,
-      strategy: {
-        maxBinId,
-        minBinId,
-        strategyType: toStrategyType(strategy),
-      },
+      strategy: strategyParams,
       slippage: config.slippageBps / 100,
     });
 
@@ -399,6 +415,7 @@ export async function deployPosition(
       priceRangeMin,
       priceRangeMax,
       binCount:       maxBinId - minBinId + 1,
+      rentSol,
     };
 
   } catch (err) {
@@ -630,17 +647,62 @@ export async function closePosition(
   }
 }
 
+// ── Realizable-value swap quote ─────────────────────────────────
+//
+// When closing a position, the SOL side comes back as SOL but the non-SOL
+// side has to be swapped to realize SOL value. On thin pools that swap can
+// eat 10–30% slippage, so the position value at mid-price is too optimistic.
+// Pre-quote it so the healer can decide STAY vs CLOSE with realistic data.
+
+async function quoteTokenToSol(
+  dlmmPool: DLMM,
+  sides:    PoolSides,
+  tokenAmountRaw: number,
+): Promise<{ outSol: number; priceImpactPct: number } | null> {
+  if (!Number.isFinite(tokenAmountRaw) || tokenAmountRaw <= 0) {
+    return { outSol: 0, priceImpactPct: 0 };
+  }
+
+  // BN constructor asserts on non-integer / out-of-safe-range numbers.
+  // Build from a precise integer string instead.
+  const intStr = Math.floor(tokenAmountRaw).toString();
+  if (!/^\d+$/.test(intStr)) return null;
+
+  const swapForY = !sides.solIsX;   // we want SOL out — opposite side of token
+  try {
+    const binArrays = await dlmmPool.getBinArrayForSwap(swapForY, 3);
+    if (!binArrays || binArrays.length === 0) return null;
+    const inAmount    = new BN(intStr);
+    const slippageBps = new BN(500);  // quote tolerance, not execution
+    const quote = dlmmPool.swapQuote(inAmount, swapForY, slippageBps, binArrays, true);
+    const outSol         = Number(quote.outAmount.toString()) / 1e9;
+    const priceImpactPct = Number(quote.priceImpact.toString()) * 100;
+    return { outSol, priceImpactPct };
+  } catch (err) {
+    // SDK asserts when liquidity in the queried bin arrays can't cover the
+    // swap — natural for thin pools or amounts beyond the ±3 bin-array window.
+    // Non-fatal: caller falls back to mid-price valuation.
+    logger.debug('quoteTokenToSol skipped (insufficient liquidity in queried bin arrays)', {
+      tokenAmountRaw,
+      err: (err as Error).message,
+    });
+    return null;
+  }
+}
+
 // ── Get live position data ─────────────────────────────────────
 
 export interface LivePositionData {
-  isInRange:      boolean;
-  currentPrice:   number;
-  feesEarnedSol:  number;
-  positionValueSol: number;
-  ilSol:          number;
-  currentTvl:     number;
-  currentVolume:  number;
-  feeTvlRatio:    number;
+  isInRange:         boolean;
+  currentPrice:      number;
+  feesEarnedSol:     number;
+  positionValueSol:  number;     // value at mid-price (optimistic)
+  realizableValueSol: number;    // value after swapping token side to SOL (realistic)
+  closeSlippagePct:  number;     // price impact of that swap
+  ilSol:             number;
+  currentTvl:        number;
+  currentVolume:     number;
+  feeTvlRatio:       number;
 }
 
 export async function getLivePositionData(
@@ -681,6 +743,25 @@ export async function getLivePositionData(
     const positionValueSol = ilResult.positionValueSol;
     const ilSol = ilResult.ilSol;
 
+    // Realizable value via swap quote against real on-chain liquidity.
+    // Even in dry mode the pool's bins are real, so the slippage estimate is real.
+    let realizableValueSol = positionValueSol;
+    let closeSlippagePct   = 0;
+    try {
+      const dlmmPool = await getDLMM(getConnection(), new PublicKey(poolAddress));
+      const sides    = getPoolSides(dlmmPool);
+      const tokenDecimals = sides.solIsX ? sides.decimalsY : sides.decimalsX;
+      const tokenSideRaw  = ilResult.tokenQty * Math.pow(10, tokenDecimals);
+      const solSideSol    = positionValueSol - ilResult.tokenQty * currentPrice; // approx SOL bins
+      const q = await quoteTokenToSol(dlmmPool, sides, tokenSideRaw);
+      if (q) {
+        realizableValueSol = Math.max(0, solSideSol) + q.outSol;
+        closeSlippagePct   = q.priceImpactPct;
+      }
+    } catch (err) {
+      logger.debug('[DRY RUN] realizable value quote skipped', { err: (err as Error).message });
+    }
+
     // Live pool health via on-chain SDK
     let snapTvl = pos.tvl_usd ?? 0;
     let snapVolume = pos.volume_24h_usd ?? 0;
@@ -720,6 +801,8 @@ export async function getLivePositionData(
       currentPrice,
       feesEarnedSol:    state.pendingFees,
       positionValueSol,
+      realizableValueSol,
+      closeSlippagePct,
       ilSol,
       currentTvl:       snapTvl,
       currentVolume:    snapVolume,
@@ -765,6 +848,18 @@ export async function getLivePositionData(
 
     const ilSol = Math.max(0, solDeployed - positionValueSol - feesEarnedSol);
 
+    // Realizable value: SOL side comes back as SOL, token side has to be swapped.
+    let realizableValueSol = positionValueSol;
+    let closeSlippagePct   = 0;
+    const tokenSideRaw = sides.solIsX ? posYRaw : posXRaw;
+    const solSideRaw   = sides.solIsX ? posXRaw : posYRaw;
+    const solSideSol   = solSideRaw / 1e9;
+    const q = await quoteTokenToSol(dlmmPool, sides, tokenSideRaw);
+    if (q) {
+      realizableValueSol = solSideSol + q.outSol;
+      closeSlippagePct   = q.priceImpactPct;
+    }
+
     // Live pool health via on-chain SDK
     const poolHealth = await getLivePoolHealth(poolAddress);
     const liveTvl    = poolHealth?.currentTvl ?? 0;
@@ -787,6 +882,8 @@ export async function getLivePositionData(
       currentPrice,
       feesEarnedSol,
       positionValueSol,
+      realizableValueSol,
+      closeSlippagePct,
       ilSol,
       currentTvl,
       currentVolume,
@@ -807,28 +904,34 @@ export async function getLivePositionData(
 // to verify so this is a no-op there.
 
 export async function reconcileOpenPositions(): Promise<{
-  checked: number;
-  orphans: { id: number; symbol: string; reason: string }[];
+  checked:        number;
+  orphans:        { id: number; symbol: string; reason: string }[];
+  emptyClosed:    number;     // untracked empty positions cleaned up — rent recovered
+  rentRecovered:  number;     // approximate SOL recovered from empty closes
 }> {
   const open = getOpenPositions();
-  if (open.length === 0) return { checked: 0, orphans: [] };
+  if (open.length === 0 && config.dryRun) {
+    return { checked: 0, orphans: [], emptyClosed: 0, rentRecovered: 0 };
+  }
 
   if (config.dryRun) {
     logger.info('Reconciliation skipped (dry mode — nothing on-chain to verify)', { open: open.length });
-    return { checked: open.length, orphans: [] };
+    return { checked: open.length, orphans: [], emptyClosed: 0, rentRecovered: 0 };
   }
 
   const conn   = getConnection();
   const wallet = getWallet();
   const orphans: { id: number; symbol: string; reason: string }[] = [];
 
-  // Group by pool to make one on-chain call per pool, not per position.
+  // Group tracked positions by pool to make one on-chain call per pool.
   const byPool = new Map<string, any[]>();
   for (const p of open) {
     if (!byPool.has(p.pool_address)) byPool.set(p.pool_address, []);
     byPool.get(p.pool_address)!.push(p);
   }
 
+  // Verify tracked positions
+  const trackedKeysGlobal = new Set<string>(open.map(p => p.position_pubkey).filter(Boolean));
   for (const [poolAddress, rows] of byPool) {
     let onchainKeys = new Set<string>();
     try {
@@ -850,6 +953,51 @@ export async function reconcileOpenPositions(): Promise<{
     }
   }
 
-  return { checked: open.length, orphans };
+  // ── Untracked-empty cleanup ─────────────────────────────────────
+  // Walk every position the wallet owns across ALL pools. Any position that
+  // is not tracked in our DB AND has zero liquidity is a leftover from a
+  // crashed close — close it to recover ~0.05–0.1 SOL of rent each.
+  let emptyClosed   = 0;
+  let rentRecovered = 0;
+  try {
+    const allUserPositions = await DLMM.getAllLbPairPositionsByUser(conn, wallet.publicKey);
+    for (const [lbPairStr, info] of allUserPositions) {
+      for (const pos of info.lbPairPositionsData) {
+        const pkStr = pos.publicKey.toString();
+        if (trackedKeysGlobal.has(pkStr)) continue;
+
+        const isEmpty = pos.positionData.positionBinData.every(
+          (b: any) => Number(b.positionXAmount ?? 0) === 0 && Number(b.positionYAmount ?? 0) === 0
+        );
+        if (!isEmpty) {
+          logger.warn('Reconciliation: untracked NON-EMPTY position on-chain', {
+            pool: lbPairStr, pubkey: pkStr,
+          });
+          continue;
+        }
+
+        try {
+          const dlmmPool = await getDLMM(conn, new PublicKey(lbPairStr));
+          const closeRaw = await dlmmPool.closePositionIfEmpty({
+            owner:    wallet.publicKey,
+            position: pos as any,
+          });
+          const txs = Array.isArray(closeRaw) ? closeRaw : [closeRaw];
+          await sendTxs(conn, txs, [wallet]);
+          emptyClosed   += 1;
+          rentRecovered += 0.057;   // typical position rent — actual delta is in wallet balance
+          logger.info('Reconciliation: closed untracked empty position', { pool: lbPairStr, pubkey: pkStr });
+        } catch (err) {
+          logger.warn('closePositionIfEmpty failed', {
+            pool: lbPairStr, pubkey: pkStr, err: (err as Error).message,
+          });
+        }
+      }
+    }
+  } catch (err) {
+    logger.warn('Untracked-position scan failed', { err: (err as Error).message });
+  }
+
+  return { checked: open.length, orphans, emptyClosed, rentRecovered };
 }
 
