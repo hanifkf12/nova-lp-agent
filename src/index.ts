@@ -124,9 +124,10 @@ async function runHunterCycle(): Promise<void> {
       }
 
       const strategy = config.lpStrategy === 'auto' ? decision.strategy : config.lpStrategy;
-      const sized    = positionByNovaScore(
+      const rawAmount = decision.solAmount > 0 ? decision.solAmount : config.maxPositionSol;
+      const sized     = positionByNovaScore(
         candidate.novaScore,
-        Math.min(Math.min(decision.solAmount, config.maxPositionSol), solBalance - 0.1)
+        Math.min(Math.min(rawAmount, config.maxPositionSol), solBalance - 0.1)
       );
 
       if (sized < config.minPositionSol) {
@@ -139,6 +140,8 @@ async function runHunterCycle(): Promise<void> {
         strategy,
         sized,
         decision.binRange || config.binRange,
+        candidate.currentPrice,
+        candidate.binStep,
       );
 
       if (!result.success) {

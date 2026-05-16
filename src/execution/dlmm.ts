@@ -102,29 +102,38 @@ async function getDLMM(conn: Connection, poolPubkey: PublicKey): Promise<DLMM> {
 
 // ── Safe price from lamports (handles large BN values) ─────────
 
-function safePriceFromLamport(dlmmPool: DLMM, lamportPrice: BN): number {
+// Accepts BN, Decimal, decimal string, or number — SDK returns mixed forms.
+// BN cannot parse decimals/scientific notation, so callers must NOT wrap
+// SDK-provided price strings in `new BN(...)`; pass the raw value here.
+function safePriceFromLamport(
+  dlmmPool: DLMM,
+  lamportPrice: BN | Decimal | string | number,
+): number {
+  const priceStr = typeof lamportPrice === 'number'
+    ? String(lamportPrice)
+    : lamportPrice.toString();
+
   try {
-    const d = dlmmPool.fromPricePerLamport(Number(lamportPrice.toString()));
+    const d = dlmmPool.fromPricePerLamport(Number(priceStr));
     const n = Number(d);
     if (Number.isFinite(n) && n > 0) return n;
   } catch { /* fall through */ }
-  // Fallback: compute manually using token decimals
-  const binStep = Number((dlmmPool as any).lbPair?.binStep ?? 100);
+
+  // Fallback: scale by token decimals
   const xDec = (dlmmPool as any).tokenX?.decimal ?? (dlmmPool as any).tokenX?.mint?.decimals ?? 9;
   const yDec = (dlmmPool as any).tokenY?.decimal ?? (dlmmPool as any).tokenY?.mint?.decimals ?? 9;
-  const raw = new Decimal(lamportPrice.toString());
-  const scaled = raw.div(Decimal.pow(10, binStep === 0 ? 1 : 0))
-    .mul(Decimal.pow(10, yDec))
-    .div(Decimal.pow(10, xDec));
-  return Number(scaled) || 1;
+  try {
+    const raw = new Decimal(priceStr);
+    const scaled = raw.mul(Decimal.pow(10, yDec)).div(Decimal.pow(10, xDec));
+    const n = Number(scaled);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch { /* fall through */ }
+  return 0;
 }
 
 function priceAtBinId(dlmmPool: DLMM, binId: number, binStep: number): number {
   const raw = getPriceOfBinByBinId(binId, binStep);
-  if (typeof raw === 'object' && raw !== null && 'toString' in raw) {
-    return safePriceFromLamport(dlmmPool, new BN(raw.toString()));
-  }
-  return safePriceFromLamport(dlmmPool, new BN(String(raw)));
+  return safePriceFromLamport(dlmmPool, raw as any);
 }
 
 // Read-only on-chain lookup for a pool's current price, active bin, bin step.
@@ -133,30 +142,36 @@ async function getDLMMReadOnly(poolAddress: string): Promise<{
   activeBinId:  number;
   binStep:      number;
 } | null> {
-  const attempt = async () => {
-    const conn       = getConnection();
+  const attemptWith = async (conn: Connection) => {
     const poolPubkey = new PublicKey(poolAddress);
     const dlmmPool   = await getDLMM(conn, poolPubkey);
     const activeBin  = await dlmmPool.getActiveBin();
     const activeBinId = Number(activeBin.binId);
-    const currentPrice = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
+    const currentPrice = safePriceFromLamport(dlmmPool, activeBin.price);
     const binStep = Number((dlmmPool as any).lbPair?.binStep ?? 0);
     if (!Number.isFinite(currentPrice) || currentPrice <= 0 || binStep <= 0) return null;
     return { currentPrice, activeBinId, binStep };
   };
 
-  try {
-    return await attempt();
-  } catch (err) {
-    logger.warn('getDLMMReadOnly failed, rotating RPC', { poolAddress, err: (err as Error).message });
-    rotateRpc();
+  // Try current RPC first, then exhaust all fallbacks
+  const tried = new Set<number>();
+  for (let i = 0; i < rpcEndpoints.length; i++) {
+    if (tried.has(rpcIdx)) break;
+    tried.add(rpcIdx);
     try {
-      return await attempt();
-    } catch (err2) {
-      logger.warn('getDLMMReadOnly retry failed', { poolAddress, err: (err2 as Error).message });
-      return null;
+      return await attemptWith(getConnection());
+    } catch (err) {
+      const msg = (err as Error).message.slice(0, 80);
+      if (i < rpcEndpoints.length - 1) {
+        logger.warn('getDLMMReadOnly RPC failed, rotating', { poolAddress, err: msg });
+        rotateRpc();
+      } else {
+        logger.warn('getDLMMReadOnly all RPCs exhausted', { poolAddress, err: msg });
+      }
     }
   }
+
+  return null;
 }
 
 // ── Live pool health via on-chain SDK ──────────────────────────
@@ -178,7 +193,7 @@ export async function getLivePoolHealth(poolAddress: string): Promise<{
     const decimalsY    = (dlmmPool as any).tokenY?.decimal ?? (dlmmPool as any).tokenY?.mint?.decimals ?? 9;
     const activeBin    = await dlmmPool.getActiveBin();
     const activeBinId  = Number(activeBin.binId);
-    const currentPrice = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
+    const currentPrice = safePriceFromLamport(dlmmPool, activeBin.price);
 
     let dynamicFee = 0;
     try {
@@ -283,19 +298,28 @@ export async function deployPosition(
   strategy:    string,
   solAmount:   number,
   binRange:    number = config.binRange,
+  knownPrice?: number,
+  knownBinStep?: number,
 ): Promise<DeployResult> {
 
   if (config.dryRun) {
-    const onchain = await getDLMMReadOnly(poolAddress);
-    if (!onchain) {
-      logger.warn('[DRY RUN] deployPosition: on-chain read failed, skipping deploy', { poolAddress });
-      return { success: false, error: 'on-chain read failed' };
+    const bs   = knownBinStep ?? 100;
+    let entryPrice = knownPrice ?? 0;
+
+    // Try on-chain for better price; fall back to known price from API
+    if (!entryPrice || entryPrice <= 0) {
+      const onchain = await getDLMMReadOnly(poolAddress);
+      if (onchain && onchain.currentPrice > 0) {
+        entryPrice = onchain.currentPrice;
+      }
     }
-    const { currentPrice: entryPrice, binStep } = onchain;
-    if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
-      logger.warn('[DRY RUN] deployPosition: invalid entry price', { poolAddress, entryPrice });
-      return { success: false, error: 'invalid entry price' };
+
+    if (!entryPrice || entryPrice <= 0 || !Number.isFinite(entryPrice)) {
+      logger.warn('[DRY RUN] deployPosition: no valid price available, skipping', { poolAddress });
+      return { success: false, error: 'no valid price' };
     }
+
+    const binStep = knownBinStep ?? bs;
     const factor = Math.pow(1 + binStep / 10000, binRange - 1);
     const priceRangeMin = entryPrice / factor;
     const priceRangeMax = entryPrice;
@@ -322,7 +346,7 @@ export async function deployPosition(
     const sides      = getPoolSides(dlmmPool);
 
     const activeBin     = await dlmmPool.getActiveBin();
-    const entryPriceNum = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
+    const entryPriceNum = safePriceFromLamport(dlmmPool, activeBin.price);
     const activeBinId   = Number(activeBin.binId);
 
     let minBinId: number, maxBinId: number;
@@ -519,7 +543,7 @@ export async function claimFees(
     const feeYRaw = Number(position.positionData.feeY);
 
     const activeBin   = await dlmmPool.getActiveBin();
-    const currentPrice = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
+    const currentPrice = safePriceFromLamport(dlmmPool, activeBin.price);
 
     const claimRaw = await dlmmPool.claimAllRewards({
       owner:    wallet.publicKey,
@@ -579,7 +603,7 @@ export async function closePosition(
     const feeYRaw = Number(position.positionData.feeY);
 
     const activeBin   = await dlmmPool.getActiveBin();
-    const currentPrice = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
+    const currentPrice = safePriceFromLamport(dlmmPool, activeBin.price);
 
     const binIds   = position.positionData.positionBinData.map((b: any) => b.binId);
     const fromBin  = Math.min(...binIds);
@@ -712,7 +736,7 @@ export async function getLivePositionData(
 
     const activeBin    = await dlmmPool.getActiveBin();
     const activeBinId  = Number(activeBin.binId);
-    const currentPrice = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
+    const currentPrice = safePriceFromLamport(dlmmPool, activeBin.price);
 
     const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
     const position = userPositions.find(p => p.publicKey.toString() === positionPubkey);

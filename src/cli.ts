@@ -24,7 +24,7 @@ async function cmdScreen(): Promise<void> {
     console.log(
       `${p.novaScore.toFixed(0).padStart(5)}  ` +
       `${p.tokenSymbol.padEnd(13)}  ` +
-      `${(p.feeTvlRatio * 100).toFixed(2).padStart(6)}%  ` +
+      `${(p.feeTvlRatio).toFixed(2).padStart(6)}%  ` +
       `${fmt(p.volume24hUsd)} ` +
       `${fmt(p.tvlUsd)} ` +
       `${p.riskLevel.padEnd(6)}  ` +

@@ -219,12 +219,14 @@ function hunterStaticRules(): string {
 - BID_ASK: concentrated at the edges, good for volatile pools / passive DCA
 
 === HARD RULES ===
-- Fee/TVL ratio < 5% → usually SKIP (fee inefficiency)
+- Fee/TVL lower than 5% → SKIP (not enough fee revenue to justify IL risk)
+- Fee/TVL between 5% and 60% → good range, DEPLOY if Nova score is high
+- Fee/TVL above 60% → consider DEPLOY but check if pool is too volatile (high ratio = high risk)
 - Nova score < 50 → SKIP
 - Bundle % > 40% → SKIP (supply manipulation)
 - Risk HIGH → only deploy if confidence > 0.85 and there's a relevant lesson
 - Max deploy per position = min(${config.maxPositionSol} SOL, 20% of total capital)
-- Prefer fresh pools (high volume, growing holders) over stale pools
+- Prefer fresh pools with active trading over stale ones
 
 Output via tool call \`submit_deploy_decisions\`. The order of decisions MUST match the order of CANDIDATE blocks in the user message.`;
 }
@@ -242,7 +244,9 @@ function healerStaticRules(): string {
 - PnL < -${(config.stopLossPct * 100).toFixed(0)}% (includes IL) → CLOSE (stop loss)
 - PnL > +${(config.takeProfitPct * 100).toFixed(0)}% → CLOSE (take profit)
 - Out of range > 2 hours → REDEPLOY to a new range around the current price
-- Fee/TVL ratio dropped < 2% while in-range → consider CLOSE (pool dying)
+- Fee/TVL dropped below 2% while in-range → consider CLOSE (pool dying — fee rate too low to justify IL risk)
+- Fee/TVL between 2% and 10% → acceptable but not great, stay if PnL is positive
+- Fee/TVL above 10% → good fee generation, bias toward STAY
 - Fees > 0.01 SOL accumulated and in-range → CLAIM_FEES then STAY
 - Position open < 1 hour → bias toward STAY unless stop-loss triggers
 
@@ -291,7 +295,7 @@ Symbol         : ${c.tokenSymbol}
 Nova Score     : ${c.novaScore.toFixed(1)}/100
 Risk Level     : ${c.riskLevel}
 Pool Address   : ${c.poolAddress}
-Fee/TVL Ratio  : ${(c.feeTvlRatio * 100).toFixed(2)}%
+Fee/TVL Ratio  : ${(c.feeTvlRatio).toFixed(2)}% (daily — HIGHER = MORE fees for LP)
 Volume 24h     : $${c.volume24hUsd.toLocaleString()}
 TVL            : $${c.tvlUsd.toLocaleString()}
 Organic Score  : ${c.organicScore.toFixed(0)}/100
@@ -376,7 +380,7 @@ Current price: ${liveData.currentPrice.toFixed(8)}
 === POOL HEALTH ===
 Current TVL  : $${liveData.currentTvl.toLocaleString()}
 Volume 24h   : $${liveData.currentVolume.toLocaleString()}
-Fee/TVL ratio: ${(liveData.feeTvlRatio * 100).toFixed(2)}%
+Fee/TVL ratio: ${(liveData.feeTvlRatio).toFixed(2)}%
 
 === LESSONS ===
 ${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'No lessons yet.'}`,

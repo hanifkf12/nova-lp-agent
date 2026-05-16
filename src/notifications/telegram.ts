@@ -65,7 +65,7 @@ export async function alertDeploy(params: {
     `Strategy : ${md(p.strategy.toUpperCase())}\n` +
     `Amount   : ${p.solAmount.toFixed(4)} SOL ($${usd(p.solAmount)})\n` +
     `Nova Score: ${p.novaScore.toFixed(1)}/100\n` +
-    `Fee/TVL  : ${(p.feeTvlRatio * 100).toFixed(2)}%\n` +
+    `Fee/TVL  : ${(p.feeTvlRatio).toFixed(2)}%\n` +
     `Confidence: ${Math.round(p.confidence * 100)}%\n` +
     `Reasoning: _${md(p.reasoning)}_\n` +
     `Pool: \`${p.poolAddress.slice(0, 20)}...\``
