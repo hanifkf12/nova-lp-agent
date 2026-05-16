@@ -10,7 +10,8 @@
     "dry": "DRY_RUN=true ts-node src/index.ts",
     "screen": "ts-node src/cli.ts screen",
     "stats": "ts-node src/cli.ts stats",
-    "positions": "ts-node src/cli.ts positions"
+    "positions": "ts-node src/cli.ts positions",
+    "lessons": "ts-node src/cli.ts lessons"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.24.0",

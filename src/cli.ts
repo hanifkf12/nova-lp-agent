@@ -3,8 +3,9 @@
 //   npm run screen     → scan pools now, print top candidates
 //   npm run stats      → show performance + recent closes
 //   npm run positions  → list open positions
+//   npm run lessons    → manage the lessons table (list / show / delete / prune)
 
-import { initDB, getOpenPositions, buildPerformanceMemory } from './db';
+import { initDB, getOpenPositions, buildPerformanceMemory, db } from './db';
 import { huntPools } from './screening/hunter';
 import { logger } from './utils/logger';
 import { refreshSolPriceUsd } from './utils/solPrice';
@@ -77,7 +78,112 @@ async function cmdSolPrice(): Promise<void> {
   console.log(`SOL = $${p.toFixed(2)}`);
 }
 
+function cmdLessons(args: string[]): void {
+  initDB();
+  const sub = args[0] ?? 'list';
+
+  if (sub === 'list') {
+    const rows = db.prepare(`
+      SELECT id, role, content, confidence, created_at, source
+      FROM lessons ORDER BY id DESC
+    `).all() as any[];
+    if (rows.length === 0) { console.log('No lessons in DB.'); return; }
+    console.log(`\n${rows.length} lesson(s):\n`);
+    console.log('  ID  Role     Age   Conf  Src     PnL    Content');
+    console.log('────  ───────  ────  ────  ──────  ─────  ────────────────────────────────────────────');
+    for (const r of rows) {
+      const ageH = Math.floor((Date.now() - r.created_at) / 3600000);
+      const age  = ageH < 24 ? `${ageH}h` : `${Math.floor(ageH / 24)}d`;
+      let pnlTag = '   -';
+      if (r.source) {
+        const src = db.prepare('SELECT pnl_sol FROM positions WHERE id = ?').get(Number(r.source)) as any;
+        if (src && src.pnl_sol !== null) pnlTag = (src.pnl_sol >= 0 ? '+' : '') + src.pnl_sol.toFixed(2);
+      }
+      console.log(
+        `${String(r.id).padStart(4)}  ` +
+        `${(r.role ?? '').padEnd(7)}  ` +
+        `${age.padEnd(4)}  ` +
+        `${r.confidence.toFixed(2).padEnd(4)}  ` +
+        `${(r.source ?? '-').padEnd(6)}  ` +
+        `${pnlTag.padEnd(5)}  ` +
+        r.content.slice(0, 90)
+      );
+    }
+    console.log('\nTip: `npm run lessons -- show <id>` to read full text, `delete <id>` to remove one.');
+    return;
+  }
+
+  if (sub === 'show') {
+    const id = Number(args[1] ?? 0);
+    if (!id) { console.error('Usage: npm run lessons -- show <id>'); return; }
+    const row = db.prepare('SELECT * FROM lessons WHERE id = ?').get(id) as any;
+    if (!row) { console.log(`No lesson with id ${id}.`); return; }
+    console.log(`\n#${row.id}  role=${row.role}  conf=${row.confidence}  source=${row.source ?? '-'}`);
+    console.log(`Created: ${new Date(row.created_at).toISOString()}\n`);
+    console.log(row.content);
+    console.log('');
+    return;
+  }
+
+  if (sub === 'delete') {
+    const id = Number(args[1] ?? 0);
+    if (!id) { console.error('Usage: npm run lessons -- delete <id>'); return; }
+    const result = db.prepare('DELETE FROM lessons WHERE id = ?').run(id);
+    console.log(`Deleted ${result.changes} lesson(s).`);
+    return;
+  }
+
+  if (sub === 'prune-losing') {
+    // Lessons whose source is a position that closed at a loss
+    const result = db.prepare(`
+      DELETE FROM lessons
+      WHERE source IS NOT NULL
+        AND CAST(source AS INTEGER) IN (
+          SELECT id FROM positions WHERE status = 'closed' AND pnl_sol < 0
+        )
+    `).run();
+    console.log(`Deleted ${result.changes} lesson(s) sourced from losing positions.`);
+    return;
+  }
+
+  if (sub === 'prune-pool') {
+    const pool = args[1];
+    if (!pool) { console.error('Usage: npm run lessons -- prune-pool <pool_address>'); return; }
+    const result = db.prepare(`
+      DELETE FROM lessons
+      WHERE source IS NOT NULL
+        AND CAST(source AS INTEGER) IN (
+          SELECT id FROM positions WHERE pool_address = ?
+        )
+    `).run(pool);
+    console.log(`Deleted ${result.changes} lesson(s) sourced from positions on pool ${pool}.`);
+    return;
+  }
+
+  if (sub === 'prune-all') {
+    if (!args.includes('--yes')) {
+      console.error('This will delete ALL lessons. Re-run with --yes to confirm:');
+      console.error('  npm run lessons -- prune-all --yes');
+      return;
+    }
+    const result = db.prepare('DELETE FROM lessons').run();
+    console.log(`Deleted ${result.changes} lesson(s). Table is now empty.`);
+    return;
+  }
+
+  console.log(
+    'Usage:\n' +
+    '  npm run lessons                       list all lessons\n' +
+    '  npm run lessons -- show <id>          print full lesson content\n' +
+    '  npm run lessons -- delete <id>        delete one lesson\n' +
+    '  npm run lessons -- prune-losing       delete lessons sourced from losing positions\n' +
+    '  npm run lessons -- prune-pool <addr>  delete lessons sourced from one pool\n' +
+    '  npm run lessons -- prune-all --yes    delete ALL lessons'
+  );
+}
+
 const cmd = process.argv[2] ?? 'help';
+const rest = process.argv.slice(3);
 (async () => {
   try {
     switch (cmd) {
@@ -85,8 +191,9 @@ const cmd = process.argv[2] ?? 'help';
       case 'stats':     cmdStats();           break;
       case 'positions': cmdPositions();       break;
       case 'solprice':  await cmdSolPrice();  break;
+      case 'lessons':   cmdLessons(rest);     break;
       default:
-        console.log('Usage: ts-node src/cli.ts <screen|stats|positions|solprice>');
+        console.log('Usage: ts-node src/cli.ts <screen|stats|positions|solprice|lessons>');
     }
   } catch (err) {
     logger.error('CLI error', { err });
