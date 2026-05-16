@@ -5,7 +5,7 @@ import { refreshSolPriceUsd } from './utils/solPrice';
 import {
   initDB, insertPosition, closePosition as dbClosePosition,
   getOpenPositions, addLesson, setState,
-  setPoolCooldown,
+  setPoolCooldown, poolLossCount, recentRedeployCount,
   addFeesClaimed,
   db,
 } from './db';
@@ -241,15 +241,18 @@ async function healOnePosition(pos: any): Promise<void> {
     await alertOutOfRange(pos.token_symbol, pos.pool_address);
   }
 
+  const redeployCount24h = recentRedeployCount(pos.pool_address, 24);
+
   const decision = await askHealer(pos, {
-    currentPrice:  liveData.currentPrice,
-    feesEarnedSol: liveData.feesEarnedSol,
-    isInRange:     liveData.isInRange,
+    currentPrice:    liveData.currentPrice,
+    feesEarnedSol:   liveData.feesEarnedSol,
+    isInRange:       liveData.isInRange,
     pnlPct,
     hoursOpen,
-    currentTvl:    liveData.currentTvl,
-    currentVolume: liveData.currentVolume,
-    feeTvlRatio:   liveData.feeTvlRatio,
+    currentTvl:      liveData.currentTvl,
+    currentVolume:   liveData.currentVolume,
+    feeTvlRatio:     liveData.feeTvlRatio,
+    redeployCount24h,
   });
 
   logger.info('Healer decision', {
@@ -337,7 +340,18 @@ async function healOnePosition(pos: any): Promise<void> {
   if (pnlSol < 0) {
     agentState.consecutiveLosses += 1;
     logger.warn(`Loss streak: ${agentState.consecutiveLosses}/${agentState.maxConsecutiveLosses}`);
-    setPoolCooldown(pos.pool_address, 4);
+
+    // Escalating per-pool cooldown — count includes the loss just recorded.
+    // 1st loss → 4h, 2nd → 24h, 3rd+ → 7d. Stops the "same losing pool redeploys
+    // every 4h" failure mode where one bad pool drains capital across repeats.
+    const losses = poolLossCount(pos.pool_address, 14);
+    const cooldownHours = losses >= 3 ? 168 : losses === 2 ? 24 : 4;
+    setPoolCooldown(pos.pool_address, cooldownHours);
+    logger.warn('Pool cooldown set', {
+      pool: pos.pool_address, symbol: pos.token_symbol,
+      cooldownHours, lossesIn14d: losses,
+    });
+
     if (agentState.consecutiveLosses >= agentState.maxConsecutiveLosses) {
       agentState.isRunning = false;
       logger.error('Circuit breaker triggered — auto-paused after consecutive losses');

@@ -237,18 +237,26 @@ function healerStaticRules(): string {
 === DECISIONS ===
 - STAY: position is healthy, let it keep earning
 - CLAIM_FEES: harvest accrued fees but keep holding the position
-- CLOSE: close the position (stop loss / take profit / pool death)
-- REDEPLOY: close and re-deploy to a new range (out of range for too long)
+- CLOSE: close the position (stop loss / take profit / pool death / churning)
+- REDEPLOY: close and re-deploy to a new range (only when pool is still healthy)
 
 === HARD RULES ===
-- PnL < -${(config.stopLossPct * 100).toFixed(0)}% (includes IL) → CLOSE (stop loss)
-- PnL > +${(config.takeProfitPct * 100).toFixed(0)}% → CLOSE (take profit)
-- Out of range > 2 hours → REDEPLOY to a new range around the current price
-- Fee/TVL dropped below 2% while in-range → consider CLOSE (pool dying — fee rate too low to justify IL risk)
-- Fee/TVL between 2% and 10% → acceptable but not great, stay if PnL is positive
-- Fee/TVL above 10% → good fee generation, bias toward STAY
-- Fees > 0.01 SOL accumulated and in-range → CLAIM_FEES then STAY
-- Position open < 1 hour → bias toward STAY unless stop-loss triggers
+- PnL below -${(config.stopLossPct * 100).toFixed(0)} percent (includes IL) → CLOSE (stop loss)
+- PnL above +${(config.takeProfitPct * 100).toFixed(0)} percent → CLOSE (take profit)
+
+REDEPLOY is expensive — every redeploy realizes IL plus pays slippage twice. Use it sparingly:
+- Out of range more than 2 hours AND PnL above -5 percent AND Fee/TVL above 8 percent → REDEPLOY to a new range around the current price
+- Out of range more than 2 hours AND (PnL at or below -5 percent OR Fee/TVL at or below 8 percent) → CLOSE (do not redeploy a losing or dying pool — cut losses)
+- Pool already redeployed 1 or more times in last 24 hours → CLOSE rather than REDEPLOY again (the pool is churning — repeated redeploys compound IL)
+
+Fee/TVL guidance (values are percent — compare directly, e.g. 76.89 means 76.89%):
+- Fee/TVL below 2 percent while in-range → consider CLOSE (pool dying)
+- Fee/TVL between 2 and 10 percent → acceptable but not great, STAY only if PnL positive
+- Fee/TVL above 10 percent → good fee generation, bias toward STAY
+
+Other:
+- Fees above 0.01 SOL accumulated and in-range → CLAIM_FEES then STAY
+- Position open less than 1 hour → bias toward STAY unless stop-loss triggers
 
 Output via tool call \`submit_heal_decision\`.`;
 }
@@ -343,14 +351,15 @@ Bundle %       : ${c.bundlePct.toFixed(1)}%
 // ── HEALER ─────────────────────────────────────────────────────
 
 export async function askHealer(position: any, liveData: {
-  currentPrice:  number;
-  feesEarnedSol: number;
-  isInRange:     boolean;
-  pnlPct:        number;
-  hoursOpen:     number;
-  currentTvl:    number;
-  currentVolume: number;
-  feeTvlRatio:   number;
+  currentPrice:      number;
+  feesEarnedSol:     number;
+  isInRange:         boolean;
+  pnlPct:            number;
+  hoursOpen:         number;
+  currentTvl:        number;
+  currentVolume:     number;
+  feeTvlRatio:       number;
+  redeployCount24h?: number;
 }): Promise<HealDecision> {
 
   const lessons = getLessons('HEALER', 6);
@@ -380,7 +389,8 @@ Current price: ${liveData.currentPrice.toFixed(8)}
 === POOL HEALTH ===
 Current TVL  : $${liveData.currentTvl.toLocaleString()}
 Volume 24h   : $${liveData.currentVolume.toLocaleString()}
-Fee/TVL ratio: ${(liveData.feeTvlRatio).toFixed(2)}%
+Fee/TVL ratio: ${(liveData.feeTvlRatio).toFixed(2)} percent
+Redeploys 24h: ${liveData.redeployCount24h ?? 0} (this pool, last 24 hours)
 
 === LESSONS ===
 ${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'No lessons yet.'}`,

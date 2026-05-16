@@ -291,6 +291,28 @@ export function isPoolOnCooldown(poolAddress: string): boolean {
   return mem ? (mem.cooldown_until ?? 0) > Date.now() : false;
 }
 
+// Count losing closed positions on a pool within the lookback window.
+// Used to escalate cooldown after repeat losses on the same pool.
+export function poolLossCount(poolAddress: string, days = 14): number {
+  const since = Date.now() - days * 86400000;
+  const row = db.prepare(`
+    SELECT COUNT(*) as n FROM positions
+    WHERE pool_address = ? AND status = 'closed' AND pnl_sol < 0 AND closed_at > ?
+  `).get(poolAddress, since) as any;
+  return row?.n ?? 0;
+}
+
+// Count positions on a pool that closed via REDEPLOY in the last N hours.
+// Used by the healer to refuse re-redeploying into a churning pool.
+export function recentRedeployCount(poolAddress: string, hours = 24): number {
+  const since = Date.now() - hours * 3600000;
+  const row = db.prepare(`
+    SELECT COUNT(*) as n FROM positions
+    WHERE pool_address = ? AND status = 'closed' AND exit_reason = 'redeploy' AND closed_at > ?
+  `).get(poolAddress, since) as any;
+  return row?.n ?? 0;
+}
+
 // ── Lessons ────────────────────────────────────────────────────
 
 export function addLesson(role: string, content: string, source?: string, confidence = 0.7): void {
