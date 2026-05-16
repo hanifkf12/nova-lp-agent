@@ -52,70 +52,91 @@ interface LlmOptions {
   maxTokens?:   number;
 }
 
+const MAX_RETRIES   = 3;
+const RETRY_BASE_MS  = 2000;
+
 async function llmCall(opts: LlmOptions): Promise<{
   text:     string;
   toolArgs: Record<string, unknown> | null;
 }> {
   const http = (await import('node-fetch')).default as unknown as typeof fetch;
 
-  const body: Record<string, unknown> = {
+  const makeBody = (): Record<string, unknown> => ({
     model:      opts.model,
     max_tokens: opts.maxTokens ?? 1200,
     messages: [
       { role: 'system', content: opts.systemBlocks },
       { role: 'user',   content: opts.userBlocks   },
     ],
-  };
-
-  if (opts.tools && opts.tools.length > 0) {
-    body.tools = opts.tools;
-    if (opts.toolChoice) {
-      body.tool_choice = {
-        type: 'function',
-        function: { name: opts.toolChoice },
-      };
-    }
-  }
-
-  const res = await http(`${config.llmBaseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${config.openrouterKey}`,
-      'HTTP-Referer':  'https://nova-lp-agent.local',
-      'X-Title':       'Nova LP Agent',
-    },
-    body: JSON.stringify(body),
+    ...(opts.tools && opts.tools.length > 0
+      ? { tools: opts.tools,
+          tool_choice: opts.toolChoice
+            ? { type: 'function', function: { name: opts.toolChoice } }
+            : undefined,
+        }
+      : {}),
   });
 
-  if (!res.ok) {
-    throw new Error(`LLM ${res.status}: ${await res.text()}`);
-  }
+  let lastErr: Error | null = null;
 
-  const data    = await res.json() as any;
-  const choice  = data.choices?.[0]?.message;
-  const text    = typeof choice?.content === 'string' ? choice.content : '';
-  const tcalls  = choice?.tool_calls ?? [];
-  let toolArgs: Record<string, unknown> | null = null;
-  if (tcalls.length > 0) {
-    const raw = tcalls[0]?.function?.arguments ?? '';
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      toolArgs = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const res = await http(`${config.llmBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': `Bearer ${config.openrouterKey}`,
+          'HTTP-Referer':  'https://nova-lp-agent.local',
+          'X-Title':       'Nova LP Agent',
+        },
+        body: JSON.stringify(makeBody()),
+      });
+
+      const respText = await res.text();
+
+      if (!res.ok) {
+        throw new Error(`LLM ${res.status}: ${respText.slice(0, 200)}`);
+      }
+
+      const data    = JSON.parse(respText);
+      const choice  = data.choices?.[0]?.message;
+      const text    = typeof choice?.content === 'string' ? choice.content : '';
+      const tcalls  = choice?.tool_calls ?? [];
+      let toolArgs: Record<string, unknown> | null = null;
+      if (tcalls.length > 0) {
+        const raw = tcalls[0]?.function?.arguments ?? '';
+        try {
+          toolArgs = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        } catch (err) {
+          logger.warn('Tool args JSON parse failed', { raw: String(raw).slice(0, 200) });
+        }
+      }
+
+      const usage = data.usage ?? {};
+      if (usage.prompt_tokens_details?.cached_tokens > 0) {
+        logger.debug('LLM cache hit', {
+          cached:  usage.prompt_tokens_details.cached_tokens,
+          prompt:  usage.prompt_tokens,
+          model:   opts.model,
+        });
+      }
+
+      return { text, toolArgs };
+
     } catch (err) {
-      logger.warn('Tool args JSON parse failed', { raw, err });
+      lastErr = err as Error;
+      if (attempt < MAX_RETRIES) {
+        const delay = RETRY_BASE_MS * Math.pow(2, attempt - 1);
+        logger.warn(`LLM attempt ${attempt}/${MAX_RETRIES} failed, retrying in ${delay}ms`, {
+          model: opts.model,
+          err: (err as Error).message.slice(0, 120),
+        });
+        await new Promise(r => setTimeout(r, delay));
+      }
     }
   }
 
-  const usage = data.usage ?? {};
-  if (usage.prompt_tokens_details?.cached_tokens > 0) {
-    logger.debug('LLM cache hit', {
-      cached:  usage.prompt_tokens_details.cached_tokens,
-      prompt:  usage.prompt_tokens,
-      model:   opts.model,
-    });
-  }
-
-  return { text, toolArgs };
+  throw lastErr ?? new Error('LLM call failed after retries');
 }
 
 // ── Tool schemas ───────────────────────────────────────────────

@@ -7,6 +7,7 @@ import {
   getOpenPositions, addLesson, setState,
   setPoolCooldown,
   addFeesClaimed,
+  db,
 } from './db';
 import { huntPools } from './screening/hunter';
 import { askHunterBatch, askHealer, deriveLesson } from './intelligence/llm';
@@ -81,9 +82,11 @@ async function runHunterCycle(): Promise<void> {
 
     const deployed   = openPositions.reduce((s, p) => s + p.sol_deployed, 0);
     const totalValue = solBalance + deployed;
-    const drawdown   = (config.totalCapitalSol - totalValue) / config.totalCapitalSol;
+    const drawdown   = totalValue > 0
+      ? (config.totalCapitalSol - totalValue) / config.totalCapitalSol
+      : 0;
 
-    if (drawdown >= config.maxDrawdownPct) {
+    if (deployed > 0 && drawdown >= config.maxDrawdownPct) {
       agentState.isRunning = false;
       await alertEmergencyStop(drawdown * 100);
       logger.error('Emergency stop!', { drawdown, totalValue });
@@ -217,6 +220,20 @@ async function healOnePosition(pos: any): Promise<void> {
     ? ((totalValueSol - pos.sol_deployed) / pos.sol_deployed) * 100
     : 0;
 
+  const tirKey = `tir_${pos.id}`;
+  const tirRaw = db.prepare('SELECT value FROM agent_state WHERE key = ?').get(tirKey) as any;
+  let tirAcc = { timeInRangeS: 0, lastCheckedAt: pos.opened_at, wasInRange: false };
+  if (tirRaw) {
+    try { tirAcc = JSON.parse(tirRaw.value); } catch { /* keep default */ }
+  }
+  const nowTs = Date.now();
+  if (tirAcc.wasInRange) {
+    tirAcc.timeInRangeS += (nowTs - tirAcc.lastCheckedAt) / 1000;
+  }
+  tirAcc.lastCheckedAt = nowTs;
+  tirAcc.wasInRange = liveData.isInRange;
+  db.prepare('INSERT OR REPLACE INTO agent_state (key, value) VALUES (?, ?)').run(tirKey, JSON.stringify(tirAcc));
+
   if (!liveData.isInRange) {
     await alertOutOfRange(pos.token_symbol, pos.pool_address);
   }
@@ -266,7 +283,9 @@ async function healOnePosition(pos: any): Promise<void> {
   const feeApr = hoursOpen > 0
     ? (totalFees / pos.sol_deployed) * (8760 / hoursOpen) * 100
     : 0;
-  const inRangePct = liveData.isInRange ? 100 : 50;
+
+  const totalSecs  = hoursOpen * 3600;
+  const inRangePct = totalSecs > 0 ? (tirAcc.timeInRangeS / totalSecs) * 100 : 50;
 
   const { pnlSol, pnlPct: realizedPnlPct } = dbClosePosition(pos.id, {
     feesSol:          totalFees,
@@ -276,6 +295,8 @@ async function healOnePosition(pos: any): Promise<void> {
     feeApr,
     timeInRangePct:   inRangePct,
   });
+
+  db.prepare('DELETE FROM agent_state WHERE key = ?').run(tirKey);
 
   // Lesson generation (best-effort)
   try {

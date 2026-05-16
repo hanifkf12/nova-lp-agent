@@ -123,10 +123,32 @@ export function initDB(): void {
       thresholds  TEXT    -- JSON snapshot
     );
 
+    -- Backtest snapshots for strategy optimization
+    CREATE TABLE IF NOT EXISTS backtest_snapshots (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp     INTEGER NOT NULL,
+      pool_address  TEXT NOT NULL,
+      token_symbol  TEXT NOT NULL,
+      current_price REAL,
+      tvl_sol       REAL,
+      fee_rate      REAL,
+      holder_count  INTEGER,
+      volume_24h_sol REAL
+    );
+
+    CREATE TABLE IF NOT EXISTS backtest_runs (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_at    INTEGER NOT NULL,
+      params    TEXT,
+      result    TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_pos_status   ON positions(status);
     CREATE INDEX IF NOT EXISTS idx_pos_opened   ON positions(opened_at);
     CREATE INDEX IF NOT EXISTS idx_pos_pool     ON positions(pool_address);
     CREATE INDEX IF NOT EXISTS idx_lessons_role ON lessons(role);
+    CREATE INDEX IF NOT EXISTS idx_bt_snap_pool ON backtest_snapshots(pool_address, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_bt_snap_sym  ON backtest_snapshots(token_symbol);
   `);
 }
 

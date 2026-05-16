@@ -5,6 +5,7 @@ import {
 import DLMM, { StrategyType, getPriceOfBinByBinId } from '@meteora-ag/dlmm';
 import BN from 'bn.js';
 import bs58 from 'bs58';
+import Decimal from 'decimal.js';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { db, getState, setState, getOpenPositions, markPositionOrphan } from '../db';
@@ -99,8 +100,34 @@ async function getDLMM(conn: Connection, poolPubkey: PublicKey): Promise<DLMM> {
   return dlmmCache.get(key)!;
 }
 
+// ── Safe price from lamports (handles large BN values) ─────────
+
+function safePriceFromLamport(dlmmPool: DLMM, lamportPrice: BN): number {
+  try {
+    const d = dlmmPool.fromPricePerLamport(Number(lamportPrice.toString()));
+    const n = Number(d);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch { /* fall through */ }
+  // Fallback: compute manually using token decimals
+  const binStep = Number((dlmmPool as any).lbPair?.binStep ?? 100);
+  const xDec = (dlmmPool as any).tokenX?.decimal ?? (dlmmPool as any).tokenX?.mint?.decimals ?? 9;
+  const yDec = (dlmmPool as any).tokenY?.decimal ?? (dlmmPool as any).tokenY?.mint?.decimals ?? 9;
+  const raw = new Decimal(lamportPrice.toString());
+  const scaled = raw.div(Decimal.pow(10, binStep === 0 ? 1 : 0))
+    .mul(Decimal.pow(10, yDec))
+    .div(Decimal.pow(10, xDec));
+  return Number(scaled) || 1;
+}
+
+function priceAtBinId(dlmmPool: DLMM, binId: number, binStep: number): number {
+  const raw = getPriceOfBinByBinId(binId, binStep);
+  if (typeof raw === 'object' && raw !== null && 'toString' in raw) {
+    return safePriceFromLamport(dlmmPool, new BN(raw.toString()));
+  }
+  return safePriceFromLamport(dlmmPool, new BN(String(raw)));
+}
+
 // Read-only on-chain lookup for a pool's current price, active bin, bin step.
-// Used by dry-mode code paths since no HTTP endpoint reliably fetches a single pool.
 async function getDLMMReadOnly(poolAddress: string): Promise<{
   currentPrice: number;
   activeBinId:  number;
@@ -112,7 +139,7 @@ async function getDLMMReadOnly(poolAddress: string): Promise<{
     const dlmmPool   = await getDLMM(conn, poolPubkey);
     const activeBin  = await dlmmPool.getActiveBin();
     const activeBinId = Number(activeBin.binId);
-    const currentPrice = Number(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
+    const currentPrice = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
     const binStep = Number((dlmmPool as any).lbPair?.binStep ?? 0);
     if (!Number.isFinite(currentPrice) || currentPrice <= 0 || binStep <= 0) return null;
     return { currentPrice, activeBinId, binStep };
@@ -129,6 +156,75 @@ async function getDLMMReadOnly(poolAddress: string): Promise<{
       logger.warn('getDLMMReadOnly retry failed', { poolAddress, err: (err2 as Error).message });
       return null;
     }
+  }
+}
+
+// ── Live pool health via on-chain SDK ──────────────────────────
+
+export async function getLivePoolHealth(poolAddress: string): Promise<{
+  currentTvl: number;
+  currentFeeRate: number;
+  binStep: number;
+} | null> {
+  try {
+    const conn       = getConnection();
+    const poolPubkey = new PublicKey(poolAddress);
+    const dlmmPool   = await getDLMM(conn, poolPubkey);
+    const lbPair     = (dlmmPool as any).lbPair;
+    if (!lbPair) return null;
+
+    const binStep      = Number(lbPair.binStep ?? 100);
+    const decimalsX    = (dlmmPool as any).tokenX?.decimal ?? (dlmmPool as any).tokenX?.mint?.decimals ?? 9;
+    const decimalsY    = (dlmmPool as any).tokenY?.decimal ?? (dlmmPool as any).tokenY?.mint?.decimals ?? 9;
+    const activeBin    = await dlmmPool.getActiveBin();
+    const activeBinId  = Number(activeBin.binId);
+    const currentPrice = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
+
+    let dynamicFee = 0;
+    try {
+      const feeData = await dlmmPool.getDynamicFee();
+      dynamicFee = Number(feeData?.toString() ?? 0);
+    } catch {
+      dynamicFee = 0;
+    }
+
+    let totalX = new BN(0), totalY = new BN(0);
+    try {
+      for (let i = Math.max(0, activeBinId - 200); i <= activeBinId + 200; i++) {
+        const bin = (lbPair as any).bins?.get?.(i);
+        if (!bin) {
+          const binArr = await (lbPair as any).getBinArray?.(i);
+          if (!binArr || binArr.length === 0) continue;
+          for (const b of binArr) {
+            if (Number(b?.binId ?? -1) === i) {
+              totalX = totalX.add(new BN(b.amountX?.toString() ?? '0'));
+              totalY = totalY.add(new BN(b.amountY?.toString() ?? '0'));
+              break;
+            }
+          }
+        } else {
+          totalX = totalX.add(new BN(bin.amountX?.toString() ?? '0'));
+          totalY = totalY.add(new BN(bin.amountY?.toString() ?? '0'));
+        }
+      }
+    } catch {
+      // TVL approximation unavailable — return null for TVL
+      return { currentTvl: 0, currentFeeRate: dynamicFee, binStep };
+    }
+
+    const xTokens = Number(new Decimal(totalX.toString()).div(Decimal.pow(10, decimalsX)));
+    const yTokens = Number(new Decimal(totalY.toString()).div(Decimal.pow(10, decimalsY)));
+
+    const solIsX = (dlmmPool as any).tokenX?.publicKey?.toString?.() === SOL_MINT
+                || (dlmmPool as any).lbPair?.tokenXMint?.toString?.() === SOL_MINT;
+    const currentTvl = solIsX
+      ? xTokens + (currentPrice > 0 ? yTokens / currentPrice : 0)
+      : yTokens + xTokens * currentPrice;
+
+    return { currentTvl, currentFeeRate: dynamicFee, binStep };
+  } catch (err) {
+    logger.warn('getLivePoolHealth failed', { poolAddress, err: (err as Error).message });
+    return null;
   }
 }
 
@@ -196,8 +292,10 @@ export async function deployPosition(
       return { success: false, error: 'on-chain read failed' };
     }
     const { currentPrice: entryPrice, binStep } = onchain;
-    // Assume single-sided SOL = Y (SOL is quote, bins below active). Most memecoin/SOL pools.
-    // Range: [entryPrice / (1+binStep/10000)^(binRange-1), entryPrice]
+    if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
+      logger.warn('[DRY RUN] deployPosition: invalid entry price', { poolAddress, entryPrice });
+      return { success: false, error: 'invalid entry price' };
+    }
     const factor = Math.pow(1 + binStep / 10000, binRange - 1);
     const priceRangeMin = entryPrice / factor;
     const priceRangeMax = entryPrice;
@@ -224,13 +322,9 @@ export async function deployPosition(
     const sides      = getPoolSides(dlmmPool);
 
     const activeBin     = await dlmmPool.getActiveBin();
-    const entryPriceStr = dlmmPool.fromPricePerLamport(Number(activeBin.price));
-    const entryPriceNum = Number(entryPriceStr);
+    const entryPriceNum = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
     const activeBinId   = Number(activeBin.binId);
 
-    // Single-sided SOL deposit:
-    //  - If SOL is Y → bins below + at active (bins hold Y when current price ≥ bin price)
-    //  - If SOL is X → bins above + at active
     let minBinId: number, maxBinId: number;
     if (sides.solIsX) {
       minBinId = activeBinId;
@@ -261,14 +355,9 @@ export async function deployPosition(
     const txs = Array.isArray(createRaw) ? createRaw : [createRaw];
     const sigs = await sendTxs(conn, txs, [wallet, newPosition]);
 
-    // Compute actual price-range from chosen bin ids using the SDK helper
     const binStep = Number((dlmmPool as any).lbPair?.binStep ?? 0);
-    const priceAtBin = (binId: number): number => {
-      const raw = Number(getPriceOfBinByBinId(binId, binStep));
-      return Number(dlmmPool.fromPricePerLamport(raw));
-    };
-    const priceRangeMin = priceAtBin(minBinId);
-    const priceRangeMax = priceAtBin(maxBinId);
+    const priceRangeMin = priceAtBinId(dlmmPool, minBinId, binStep);
+    const priceRangeMax = priceAtBinId(dlmmPool, maxBinId, binStep);
 
     logger.info('Position deployed', {
       poolAddress,
@@ -296,18 +385,98 @@ export async function deployPosition(
 
 // ── Fee accounting ─────────────────────────────────────────────
 
-function feesToSol(feeXRaw: number, feeYRaw: number, sides: PoolSides, pricePerXInY: number): number {
+function feesToSol(feeXRaw: number, feeYRaw: number, sides: PoolSides, currentPrice: number): number {
   const feeXTokens = feeXRaw / Math.pow(10, sides.decimalsX);
   const feeYTokens = feeYRaw / Math.pow(10, sides.decimalsY);
   if (sides.solIsX) {
-    // X is SOL. Convert feeY (in token Y) to SOL via 1 X = pricePerXInY Y → 1 Y = 1/pricePerXInY X
-    const feeYInSol = pricePerXInY > 0 ? feeYTokens / pricePerXInY : 0;
+    const feeYInSol = currentPrice > 0 ? feeYTokens / currentPrice : 0;
     return feeXTokens + feeYInSol;
   } else {
-    // Y is SOL. 1 X = pricePerXInY Y(=SOL)
-    const feeXInSol = feeXTokens * pricePerXInY;
+    const feeXInSol = feeXTokens * currentPrice;
     return feeXInSol + feeYTokens;
   }
+}
+
+// ── DLMM-specific impermanent loss for single-sided SOL LP ─────
+//
+// Single-sided SOL (Y) deployed across N bins starting from activeBin downwards.
+// When price moves to currentPrice, each bin i between minBinId and maxBinId
+// holds either:
+//   - SOL (Y) if currentPrice >= binPrice(i)  [price above bin → SOL side]
+//   - token (X) if currentPrice < binPrice(i)  [price below bin → token side]
+//
+// This function computes the actual SOL-equivalent value of all bins and
+// subtracts from deployed to get the true DLMM IL.
+
+function computeDLMMIL(
+  solDeployed: number,
+  entryPrice: number,
+  currentPrice: number,
+  priceRangeMin: number,
+  priceRangeMax: number,
+  binCount: number,
+  binStep: number,
+): { positionValueSol: number; ilSol: number; tokenQty: number } {
+  if (binCount <= 1) {
+    const r = currentPrice / entryPrice;
+    const v2il = 2 * Math.sqrt(r) / (1 + r) - 1;
+    return {
+      positionValueSol: solDeployed * (1 + v2il),
+      ilSol: Math.max(0, solDeployed * Math.abs(v2il)),
+      tokenQty: 0,
+    };
+  }
+
+  let totalValueSol = new Decimal(0);
+  let totalTokensX = new Decimal(0);
+
+  const deployedPerBin = solDeployed / binCount;
+  const deployedLamports = new Decimal(Math.floor(deployedPerBin * 1e9));
+
+  // SOL is Y in most memecoin/SOL pools. Bins from min (lowest price) to max (entryPrice).
+  // Each bin price = entryPrice * (1 + bs/10000)^(i - maxBinId) ... no, let's compute
+  // accurately using actual bin prices.
+  //
+  // Single-sided SOL(Y) deployed from minBinId to maxBinId (active).
+  // Bin i price p_i = entryPrice * (1 + bs/10000)^(activeBinId - i)  for i <= activeBinId
+  // Actually using the SDK formula: p_i = (1 + bs/10000)^(i * ??? )
+  //
+  // Let's just use a piecewise approximation that models the actual DLMM behavior:
+  // - Bins below current price → filled with token X
+  // - Bins at/above current price → filled with SOL Y
+  // For each bin, the amount of token X = SOL_value / bin_price_at_entry
+  // For each bin, the amount of SOL Y = SOL_value
+
+  const lowerPrice = priceRangeMin;
+  const upperPrice = priceRangeMax;
+
+  for (let i = 0; i < binCount; i++) {
+    const frac = i / (binCount - 1);
+    const binPriceAtEntry = lowerPrice * Math.pow(upperPrice / lowerPrice, frac);
+
+    if (currentPrice >= binPriceAtEntry) {
+      // Price above bin → bin holds SOL (Y). Full value = deployed amount.
+      totalValueSol = totalValueSol.add(deployedLamports);
+    } else {
+      // Price below bin → all SOL was converted to token X at binPriceAtEntry.
+      // Token X amount = SOL_deployed / binPriceAtEntry (in SOL per token terms)
+      const tokensFromBin = deployedLamports.div(new Decimal(binPriceAtEntry));
+      totalTokensX = totalTokensX.add(tokensFromBin);
+    }
+  }
+
+  // Convert token X back to SOL at current price
+  const tokenValueSol = totalTokensX.mul(new Decimal(currentPrice));
+  totalValueSol = totalValueSol.add(tokenValueSol);
+
+  const positionValueSolNum = Number(totalValueSol.div(1e9));
+  const ilSolNum = Math.max(0, solDeployed - positionValueSolNum);
+
+  return {
+    positionValueSol: positionValueSolNum,
+    ilSol: ilSolNum,
+    tokenQty: Number(totalTokensX),
+  };
 }
 
 // ── Claim fees ─────────────────────────────────────────────────
@@ -349,8 +518,8 @@ export async function claimFees(
     const feeXRaw = Number(position.positionData.feeX);
     const feeYRaw = Number(position.positionData.feeY);
 
-    const activeBin    = await dlmmPool.getActiveBin();
-    const pricePerXInY = Number(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
+    const activeBin   = await dlmmPool.getActiveBin();
+    const currentPrice = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
 
     const claimRaw = await dlmmPool.claimAllRewards({
       owner:    wallet.publicKey,
@@ -359,7 +528,7 @@ export async function claimFees(
     const txs = Array.isArray(claimRaw) ? claimRaw : [claimRaw];
     await sendTxs(conn, txs, [wallet]);
 
-    const feesClaimedSol = feesToSol(feeXRaw, feeYRaw, sides, pricePerXInY);
+    const feesClaimedSol = feesToSol(feeXRaw, feeYRaw, sides, currentPrice);
     logger.info('Fees claimed', { feesClaimedSol });
     return { success: true, feesClaimedSol };
 
@@ -409,8 +578,8 @@ export async function closePosition(
     const feeXRaw = Number(position.positionData.feeX);
     const feeYRaw = Number(position.positionData.feeY);
 
-    const activeBin    = await dlmmPool.getActiveBin();
-    const pricePerXInY = Number(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
+    const activeBin   = await dlmmPool.getActiveBin();
+    const currentPrice = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
 
     const binIds   = position.positionData.positionBinData.map((b: any) => b.binId);
     const fromBin  = Math.min(...binIds);
@@ -427,9 +596,9 @@ export async function closePosition(
     const txs = Array.isArray(removeRaw) ? removeRaw : [removeRaw];
     await sendTxs(conn, txs, [wallet]);
 
-    const feesClaimedSol = feesToSol(feeXRaw, feeYRaw, sides, pricePerXInY);
+    const feesClaimedSol = feesToSol(feeXRaw, feeYRaw, sides, currentPrice);
     logger.info('Position closed', { poolAddress, positionPubkey, feesClaimedSol });
-    return { success: true, feesClaimedSol, exitPrice: pricePerXInY };
+    return { success: true, feesClaimedSol, exitPrice: currentPrice };
 
   } catch (err) {
     logger.error('Close position failed', { err });
@@ -441,10 +610,10 @@ export async function closePosition(
 
 export interface LivePositionData {
   isInRange:      boolean;
-  currentPrice:   number;       // pool quote price (Y per X), human units
-  feesEarnedSol:  number;       // unclaimed fees valued in SOL
-  positionValueSol: number;     // current liquidity value in SOL
-  ilSol:          number;       // realized IL in SOL terms
+  currentPrice:   number;
+  feesEarnedSol:  number;
+  positionValueSol: number;
+  ilSol:          number;
   currentTvl:     number;
   currentVolume:  number;
   feeTvlRatio:    number;
@@ -459,7 +628,7 @@ export async function getLivePositionData(
 
   if (config.dryRun) {
     const pos = db.prepare(
-      `SELECT id, opened_at, price_range_min, price_range_max,
+      `SELECT id, opened_at, price_range_min, price_range_max, bin_count, bin_step,
               tvl_usd, volume_24h_usd, fee_tvl_ratio
        FROM positions WHERE position_pubkey = ? AND status = 'open'`
     ).get(positionPubkey) as any;
@@ -476,35 +645,31 @@ export async function getLivePositionData(
     const currentPrice  = onchain.currentPrice;
     const priceRangeMin = pos.price_range_min ?? entryPrice * 0.95;
     const priceRangeMax = pos.price_range_max ?? entryPrice * 1.05;
-    const midRange      = (priceRangeMin + priceRangeMax) / 2;
     const isInRange     = currentPrice >= priceRangeMin && currentPrice <= priceRangeMax;
-    // Entry near top of range → SOL bins below active (solIsY); else above (solIsX).
-    const solBelow      = entryPrice >= midRange;
+    const binCount      = pos.bin_count ?? config.binRange;
+    const binStep       = pos.bin_step ?? 100;
 
-    let positionValueSol: number;
-    if (isInRange) {
-      // Mild rebalance loss while in range (Uniswap-v2 IL formula as approximation)
-      const r  = entryPrice > 0 ? currentPrice / entryPrice : 1;
-      const il = r > 0 ? 2 * Math.sqrt(r) / (1 + r) - 1 : 0;   // ≤ 0
-      positionValueSol = solDeployed * (1 + il);
-    } else if (solBelow && currentPrice < priceRangeMin) {
-      // Price fell through SOL bins → all SOL converted to token at avg midRange
-      positionValueSol = solDeployed * (currentPrice / midRange);
-    } else if (!solBelow && currentPrice > priceRangeMax) {
-      // Price rose through SOL bins → all SOL converted to token at avg midRange
-      positionValueSol = solDeployed * (currentPrice / midRange);
-    } else {
-      // Out-of-range on the side that wasn't touched → SOL untouched, no IL, no fees
-      positionValueSol = solDeployed;
+    // DLMM-specific IL: per-bin valuation instead of Uniswap-v2 formula
+    const ilResult = computeDLMMIL(
+      solDeployed, entryPrice, currentPrice,
+      priceRangeMin, priceRangeMax, binCount, binStep,
+    );
+    const positionValueSol = ilResult.positionValueSol;
+    const ilSol = ilResult.ilSol;
+
+    // Live pool health via on-chain SDK
+    let snapTvl = pos.tvl_usd ?? 0;
+    let snapVolume = pos.volume_24h_usd ?? 0;
+    let snapFeeTvl = pos.fee_tvl_ratio ?? 0;
+    let liveFeeRate: number | null = null;
+
+    const poolHealth = await getLivePoolHealth(poolAddress);
+    if (poolHealth && poolHealth.currentTvl > 0) {
+      snapTvl = poolHealth.currentTvl;
+      liveFeeRate = poolHealth.currentFeeRate;
     }
-    const ilSol = Math.max(0, solDeployed - positionValueSol);
 
-    // Stored snapshot (entry-time) for pool health — discovery API has no per-pool fetch.
-    const snapTvl    = pos.tvl_usd ?? 0;
-    const snapVolume = pos.volume_24h_usd ?? 0;
-    const snapFeeTvl = pos.fee_tvl_ratio ?? 0;
-
-    // Incremental fee accrual via persisted state
+    // Fee accrual: use live dynamic fee when available, else fallback to snapshot
     const stateKey = `dry_pos:${pos.id}`;
     const rawState = getState(stateKey);
     const state    = rawState
@@ -512,10 +677,15 @@ export async function getLivePositionData(
       : { lastTickAt: pos.opened_at, pendingFees: 0 };
     const now      = Date.now();
     const deltaSec = Math.max(0, (now - state.lastTickAt) / 1000);
-    if (isInRange && snapFeeTvl > 0) {
-      // fee_tvl_ratio from discovery API is percent (e.g., 8.09 = 8.09%/day).
-      // Convert to fraction and clamp to a sane daily ceiling.
-      const dailyYield = Math.min(snapFeeTvl / 100, 0.5);
+    if (isInRange) {
+      let dailyYield: number;
+      if (liveFeeRate !== null && liveFeeRate > 0) {
+        dailyYield = Math.min(liveFeeRate, 0.5);
+      } else if (snapFeeTvl > 0) {
+        dailyYield = Math.min(snapFeeTvl / 100, 0.5);
+      } else {
+        dailyYield = 0;
+      }
       state.pendingFees += solDeployed * dailyYield * (deltaSec / 86400);
     }
     state.lastTickAt = now;
@@ -542,7 +712,7 @@ export async function getLivePositionData(
 
     const activeBin    = await dlmmPool.getActiveBin();
     const activeBinId  = Number(activeBin.binId);
-    const currentPrice = Number(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
+    const currentPrice = safePriceFromLamport(dlmmPool, new BN(activeBin.price.toString()));
 
     const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
     const position = userPositions.find(p => p.publicKey.toString() === positionPubkey);
@@ -558,7 +728,6 @@ export async function getLivePositionData(
       Number(posData.feeX), Number(posData.feeY), sides, currentPrice,
     );
 
-    // Position value: sum bins → (amountX in SOL) + (amountY in SOL)
     let posXRaw = 0, posYRaw = 0;
     for (const b of posData.positionBinData) {
       posXRaw += Number(b.positionXAmount ?? 0);
@@ -570,17 +739,24 @@ export async function getLivePositionData(
       ? xTokens + (currentPrice > 0 ? yTokens / currentPrice : 0)
       : yTokens + xTokens * currentPrice;
 
-    // IL: difference between current value and hypothetical "held SOL"
     const ilSol = Math.max(0, solDeployed - positionValueSol - feesEarnedSol);
 
-    // Entry-time snapshot for pool health. Meteora's discovery API does not
-    // support per-pool lookup (filter is silently ignored), so we surface the
-    // values screening already vetted. They drift over a position's lifetime
-    // but stay correctly attributed to THIS pool.
+    // Live pool health via on-chain SDK
+    const poolHealth = await getLivePoolHealth(poolAddress);
+    const liveTvl    = poolHealth?.currentTvl ?? 0;
+    const liveFee    = poolHealth?.currentFeeRate ?? null;
+
+    // Fallback to entry-time snapshot if on-chain TVL is unavailable
     const snap = db.prepare(
       `SELECT tvl_usd, volume_24h_usd, fee_tvl_ratio
        FROM positions WHERE position_pubkey = ? AND status = 'open'`
     ).get(positionPubkey) as any;
+
+    const currentTvl    = liveTvl > 0 ? liveTvl : (snap?.tvl_usd ?? 0);
+    const currentVolume = snap?.volume_24h_usd ?? 0;
+    const feeTvlRatio   = liveFee !== null && liveFee > 0
+      ? liveFee * 100        // dynamic fee as percent
+      : (snap?.fee_tvl_ratio ?? 0);
 
     return {
       isInRange,
@@ -588,12 +764,12 @@ export async function getLivePositionData(
       feesEarnedSol,
       positionValueSol,
       ilSol,
-      currentTvl:     snap?.tvl_usd        ?? 0,
-      currentVolume:  snap?.volume_24h_usd ?? 0,
-      feeTvlRatio:    snap?.fee_tvl_ratio  ?? 0,
+      currentTvl,
+      currentVolume,
+      feeTvlRatio,
     };
   } catch (err) {
-    logger.warn('getLivePositionData failed', { err });
+    logger.warn('getLivePositionData failed', { err: (err as Error).message });
     return null;
   }
 }
