@@ -55,27 +55,45 @@ interface LlmOptions {
 const MAX_RETRIES   = 3;
 const RETRY_BASE_MS  = 2000;
 
+const isAnthropic = (model: string) =>
+  model.startsWith('anthropic/') || model.startsWith('claude-');
+
+function sanitizeBlocks(blocks: ContentBlock[], model: string): ContentBlock[] {
+  if (isAnthropic(model)) return blocks;
+  return blocks.map(({ cache_control, ...rest }) => rest);
+}
+
 async function llmCall(opts: LlmOptions): Promise<{
   text:     string;
   toolArgs: Record<string, unknown> | null;
 }> {
   const http = (await import('node-fetch')).default as unknown as typeof fetch;
 
-  const makeBody = (): Record<string, unknown> => ({
-    model:      opts.model,
-    max_tokens: opts.maxTokens ?? 1200,
-    messages: [
-      { role: 'system', content: opts.systemBlocks },
-      { role: 'user',   content: opts.userBlocks   },
-    ],
-    ...(opts.tools && opts.tools.length > 0
-      ? { tools: opts.tools,
-          tool_choice: opts.toolChoice
-            ? { type: 'function', function: { name: opts.toolChoice } }
-            : undefined,
-        }
-      : {}),
-  });
+  const makeBody = (): Record<string, unknown> => {
+    const isAnt = isAnthropic(opts.model);
+    const sysBlocks = sanitizeBlocks(opts.systemBlocks, opts.model);
+    const usrBlocks = sanitizeBlocks(opts.userBlocks, opts.model);
+
+    const body: Record<string, unknown> = {
+      model:      opts.model,
+      max_tokens: opts.maxTokens ?? 1200,
+      messages: [
+        { role: 'system', content: sysBlocks },
+        { role: 'user',   content: usrBlocks   },
+      ],
+    };
+
+    if (opts.tools && opts.tools.length > 0) {
+      body.tools = opts.tools;
+      if (opts.toolChoice) {
+        body.tool_choice = isAnt
+          ? { type: 'tool_use', name: opts.toolChoice }
+          : { type: 'function', function: { name: opts.toolChoice } };
+      }
+    }
+
+    return body;
+  };
 
   let lastErr: Error | null = null;
 
