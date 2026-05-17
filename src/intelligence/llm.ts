@@ -58,9 +58,24 @@ const RETRY_BASE_MS  = 2000;
 const isAnthropic = (model: string) =>
   model.startsWith('anthropic/') || model.startsWith('claude-');
 
+// OpenRouter accepts a `provider` routing field and Anthropic-style structured
+// content blocks with `cache_control`. Other gateways (sumopod, OpenAI direct,
+// Groq, etc.) reject both. We detect OpenRouter by base URL.
+const isOpenRouter = () => config.llmBaseUrl.includes('openrouter.ai');
+
 function sanitizeBlocks(blocks: ContentBlock[], model: string): ContentBlock[] {
-  if (isAnthropic(model)) return blocks;
+  // Strip cache_control unless we're going through OpenRouter to an Anthropic
+  // model — that's the only path that understands it.
+  if (isOpenRouter() && isAnthropic(model)) return blocks;
   return blocks.map(({ cache_control, ...rest }) => rest);
+}
+
+// Some gateways (sumopod via litellm) want `content: "string"` for messages
+// instead of `content: [{type:'text', text:'...'}]`. Collapse blocks to a
+// single string when we're not on a structured-content-friendly provider.
+function blocksToContent(blocks: ContentBlock[]): string | ContentBlock[] {
+  if (isOpenRouter()) return blocks;
+  return blocks.map(b => b.text).join('\n\n');
 }
 
 async function llmCall(opts: LlmOptions): Promise<{
@@ -78,8 +93,8 @@ async function llmCall(opts: LlmOptions): Promise<{
       model:      opts.model,
       max_tokens: opts.maxTokens ?? 1200,
       messages: [
-        { role: 'system', content: sysBlocks },
-        { role: 'user',   content: usrBlocks   },
+        { role: 'system', content: blocksToContent(sysBlocks) },
+        { role: 'user',   content: blocksToContent(usrBlocks) },
       ],
     };
 
@@ -99,10 +114,13 @@ async function llmCall(opts: LlmOptions): Promise<{
     // parameters we send (tools, tool_choice). Without this, Bedrock can
     // be picked and reject the call. Also prefer Anthropic direct first
     // for Claude models — it's most permissive on tool-use requests.
-    body.provider = {
-      require_parameters: true,
-      ...(isAnt ? { order: ['anthropic', 'amazon-bedrock'], allow_fallbacks: true } : {}),
-    };
+    // Skipped on non-OpenRouter gateways (they reject unknown fields).
+    if (isOpenRouter()) {
+      body.provider = {
+        require_parameters: true,
+        ...(isAnt ? { order: ['anthropic', 'amazon-bedrock'], allow_fallbacks: true } : {}),
+      };
+    }
 
     return body;
   };
