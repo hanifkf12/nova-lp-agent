@@ -3,7 +3,7 @@ dotenv.config();
 
 function req(k: string): string {
   const v = process.env[k];
-  if (!v) throw new Error(`Missing env var: ${k}`);
+  if (!v) throw new Error(`Missing xxenv var: ${k}`);
   return v;
 }
 function opt(k: string, d: string): string { return process.env[k] ?? d; }
@@ -62,6 +62,14 @@ export const config = {
   lpStrategy: opt('LP_STRATEGY', 'auto') as LPStrategy,
   binRange:   parseInt(opt('BIN_RANGE', '69')),
   slippageBps: parseInt(opt('SLIPPAGE_BPS', '200')),
+
+  // Healer guardrails
+  // If estimated close slippage exceeds this AND PnL is above stop-loss, prefer STAY —
+  // selling now would crystallize more loss than the position is currently down.
+  maxCloseSlippagePct: num('MAX_CLOSE_SLIPPAGE_PCT', 0.10),
+
+  // Meteora REST API (per-pool detail + OHLCV). Defaults to the discovery host.
+  meteoraDlmmApi: opt('METEORA_DLMM_API', 'https://pool-discovery-api.datapi.meteora.ag'),
 
   // Mode
   dryRun:    opt('DRY_RUN', '') === 'true',

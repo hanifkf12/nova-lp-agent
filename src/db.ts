@@ -123,10 +123,32 @@ export function initDB(): void {
       thresholds  TEXT    -- JSON snapshot
     );
 
+    -- Backtest snapshots for strategy optimization
+    CREATE TABLE IF NOT EXISTS backtest_snapshots (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp     INTEGER NOT NULL,
+      pool_address  TEXT NOT NULL,
+      token_symbol  TEXT NOT NULL,
+      current_price REAL,
+      tvl_sol       REAL,
+      fee_rate      REAL,
+      holder_count  INTEGER,
+      volume_24h_sol REAL
+    );
+
+    CREATE TABLE IF NOT EXISTS backtest_runs (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_at    INTEGER NOT NULL,
+      params    TEXT,
+      result    TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_pos_status   ON positions(status);
     CREATE INDEX IF NOT EXISTS idx_pos_opened   ON positions(opened_at);
     CREATE INDEX IF NOT EXISTS idx_pos_pool     ON positions(pool_address);
     CREATE INDEX IF NOT EXISTS idx_lessons_role ON lessons(role);
+    CREATE INDEX IF NOT EXISTS idx_bt_snap_pool ON backtest_snapshots(pool_address, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_bt_snap_sym  ON backtest_snapshots(token_symbol);
   `);
 }
 
@@ -267,6 +289,28 @@ export function setPoolCooldown(poolAddress: string, hours: number): void {
 export function isPoolOnCooldown(poolAddress: string): boolean {
   const mem = db.prepare('SELECT cooldown_until FROM pool_memory WHERE pool_address = ?').get(poolAddress) as any;
   return mem ? (mem.cooldown_until ?? 0) > Date.now() : false;
+}
+
+// Count losing closed positions on a pool within the lookback window.
+// Used to escalate cooldown after repeat losses on the same pool.
+export function poolLossCount(poolAddress: string, days = 14): number {
+  const since = Date.now() - days * 86400000;
+  const row = db.prepare(`
+    SELECT COUNT(*) as n FROM positions
+    WHERE pool_address = ? AND status = 'closed' AND pnl_sol < 0 AND closed_at > ?
+  `).get(poolAddress, since) as any;
+  return row?.n ?? 0;
+}
+
+// Count positions on a pool that closed via REDEPLOY in the last N hours.
+// Used by the healer to refuse re-redeploying into a churning pool.
+export function recentRedeployCount(poolAddress: string, hours = 24): number {
+  const since = Date.now() - hours * 3600000;
+  const row = db.prepare(`
+    SELECT COUNT(*) as n FROM positions
+    WHERE pool_address = ? AND status = 'closed' AND exit_reason = 'redeploy' AND closed_at > ?
+  `).get(poolAddress, since) as any;
+  return row?.n ?? 0;
 }
 
 // ── Lessons ────────────────────────────────────────────────────

@@ -29,6 +29,12 @@ function usd(sol: number): string {
   return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+// Legacy Markdown has no backslash-escape — strip the four formatting chars
+// (`_`, `*`, backtick, `[`) from dynamic content before interpolation.
+function md(s: unknown): string {
+  return String(s ?? '').replace(/[_*`\[\]]/g, ' ');
+}
+
 // ── Alerts ─────────────────────────────────────────────────────
 
 export async function alertStarted(solBal: number): Promise<void> {
@@ -55,13 +61,13 @@ export async function alertDeploy(params: {
 
   await send(
     `🟢 *LP DEPLOYED${config.dryRun ? ' [DRY]' : ''}*\n` +
-    `Token    : ${p.symbol}\n` +
-    `Strategy : ${p.strategy.toUpperCase()}\n` +
+    `Token    : ${md(p.symbol)}\n` +
+    `Strategy : ${md(p.strategy.toUpperCase())}\n` +
     `Amount   : ${p.solAmount.toFixed(4)} SOL ($${usd(p.solAmount)})\n` +
     `Nova Score: ${p.novaScore.toFixed(1)}/100\n` +
-    `Fee/TVL  : ${(p.feeTvlRatio * 100).toFixed(2)}%\n` +
+    `Fee/TVL  : ${(p.feeTvlRatio).toFixed(2)}%\n` +
     `Confidence: ${Math.round(p.confidence * 100)}%\n` +
-    `Reasoning: _${p.reasoning}_\n` +
+    `Reasoning: _${md(p.reasoning)}_\n` +
     `Pool: \`${p.poolAddress.slice(0, 20)}...\``
   );
 }
@@ -80,19 +86,19 @@ export async function alertClose(params: {
 
   await send(
     `${emoji} *LP CLOSED${config.dryRun ? ' [DRY]' : ''}*\n` +
-    `Token    : ${p.symbol}\n` +
+    `Token    : ${md(p.symbol)}\n` +
     `Fees     : ${sign}${p.feesSol.toFixed(6)} SOL (${sign}$${usd(p.feesSol)})\n` +
     `PnL      : ${sign}${p.pnlPct.toFixed(2)}%\n` +
     `Fee APR  : ${p.feeApr.toFixed(1)}%\n` +
     `Duration : ${p.hoursOpen.toFixed(1)} jam\n` +
-    `Reason   : ${p.exitReason}`
+    `Reason   : ${md(p.exitReason)}`
   );
 }
 
 export async function alertOutOfRange(symbol: string, poolAddress: string): Promise<void> {
   await send(
     `⚠️ *OUT OF RANGE*\n` +
-    `Token: ${symbol}\n` +
+    `Token: ${md(symbol)}\n` +
     `Pool: \`${poolAddress.slice(0, 20)}...\`\n` +
     `Posisi tidak earning fee — agent akan evaluasi.`
   );
@@ -101,8 +107,8 @@ export async function alertOutOfRange(symbol: string, poolAddress: string): Prom
 export async function alertEmergencyStop(drawdownPct: number): Promise<void> {
   await send(
     `🚨 *EMERGENCY STOP*\n` +
-    `Drawdown ${drawdownPct.toFixed(1)}% mencapai batas ${config.maxDrawdownPct * 100}%\\.\n` +
-    `Semua posisi akan ditutup\\. Agent dihentikan\\.`
+    `Drawdown ${drawdownPct.toFixed(1)}% mencapai batas ${config.maxDrawdownPct * 100}%.\n` +
+    `Semua posisi akan ditutup. Agent dihentikan.`
   );
 }
 
@@ -195,7 +201,7 @@ export function setupCommands(agentState: { isRunning: boolean }): void {
       const priceSign    = priceMove >= 0 ? '+' : '';
 
       return (
-        `*${i + 1}. ${p.token_symbol}* [#${p.id}] _${p.strategy}_\n` +
+        `*${i + 1}. ${md(p.token_symbol)}* (#${p.id}) _${md(p.strategy)}_\n` +
         `Status   : ${rangeEmoji} | ${hoursOpen.toFixed(1)}h open\n` +
         `Deployed : ${p.sol_deployed.toFixed(4)} SOL\n` +
         `Value    : ${totalValue.toFixed(4)} SOL (${sign}${pnlPct.toFixed(2)}%)\n` +

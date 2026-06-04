@@ -5,10 +5,11 @@ import { refreshSolPriceUsd } from './utils/solPrice';
 import {
   initDB, insertPosition, closePosition as dbClosePosition,
   getOpenPositions, addLesson, setState,
-  setPoolCooldown,
+  setPoolCooldown, poolLossCount, recentRedeployCount,
   addFeesClaimed,
+  db,
 } from './db';
-import { huntPools } from './screening/hunter';
+import { huntPools, fetchPoolDetail } from './screening/hunter';
 import { askHunterBatch, askHealer, deriveLesson } from './intelligence/llm';
 import {
   getSolBalance, deployPosition, getConnection, rotateRpc,
@@ -81,9 +82,11 @@ async function runHunterCycle(): Promise<void> {
 
     const deployed   = openPositions.reduce((s, p) => s + p.sol_deployed, 0);
     const totalValue = solBalance + deployed;
-    const drawdown   = (config.totalCapitalSol - totalValue) / config.totalCapitalSol;
+    const drawdown   = totalValue > 0
+      ? (config.totalCapitalSol - totalValue) / config.totalCapitalSol
+      : 0;
 
-    if (drawdown >= config.maxDrawdownPct) {
+    if (deployed > 0 && drawdown >= config.maxDrawdownPct) {
       agentState.isRunning = false;
       await alertEmergencyStop(drawdown * 100);
       logger.error('Emergency stop!', { drawdown, totalValue });
@@ -112,7 +115,7 @@ async function runHunterCycle(): Promise<void> {
 
       // Single gate: trust the LLM. novaScore informs the prompt but
       // doesn't block on its own.
-      if (decision.action !== 'DEPLOY' || decision.confidence < 0.65) {
+      if (decision.action !== 'DEPLOY' || decision.confidence < 0.85) {
         logger.info(`Skip ${candidate.tokenSymbol}`, {
           reason: decision.reasoning.slice(0, 80),
           confidence: decision.confidence,
@@ -121,9 +124,10 @@ async function runHunterCycle(): Promise<void> {
       }
 
       const strategy = config.lpStrategy === 'auto' ? decision.strategy : config.lpStrategy;
-      const sized    = positionByNovaScore(
+      const rawAmount = decision.solAmount > 0 ? decision.solAmount : config.maxPositionSol;
+      const sized     = positionByNovaScore(
         candidate.novaScore,
-        Math.min(Math.min(decision.solAmount, config.maxPositionSol), solBalance - 0.1)
+        Math.min(Math.min(rawAmount, config.maxPositionSol), solBalance - 0.1)
       );
 
       if (sized < config.minPositionSol) {
@@ -136,6 +140,8 @@ async function runHunterCycle(): Promise<void> {
         strategy,
         sized,
         decision.binRange || config.binRange,
+        candidate.currentPrice,
+        candidate.binStep,
       );
 
       if (!result.success) {
@@ -183,7 +189,9 @@ async function runHunterCycle(): Promise<void> {
       });
 
       // Decrement local balance + open count instead of re-reading state.
-      solBalance = Math.max(0, solBalance - sized - 0.005); // ~5k lamports rent buffer
+      // Use actual rent from quoteCreatePosition when available; fall back to ~0.06 SOL.
+      const actualRent = result.rentSol ?? 0.06;
+      solBalance = Math.max(0, solBalance - sized - actualRent - 0.005); // +tx fee buffer
       openCount += 1;
       setState('sol_balance', solBalance.toString());
     }
@@ -211,25 +219,61 @@ async function healOnePosition(pos: any): Promise<void> {
     return;
   }
 
-  const hoursOpen = (Date.now() - pos.opened_at) / 3600000;
-  const totalValueSol = liveData.positionValueSol + liveData.feesEarnedSol;
-  const pnlPct = pos.sol_deployed > 0
+  const hoursOpen       = (Date.now() - pos.opened_at) / 3600000;
+  const totalValueSol   = liveData.positionValueSol + liveData.feesEarnedSol;
+  const realizableTotal = liveData.realizableValueSol + liveData.feesEarnedSol;
+  const pnlPct          = pos.sol_deployed > 0
     ? ((totalValueSol - pos.sol_deployed) / pos.sol_deployed) * 100
     : 0;
+  const realizablePnlPct = pos.sol_deployed > 0
+    ? ((realizableTotal - pos.sol_deployed) / pos.sol_deployed) * 100
+    : 0;
+
+  const tirKey = `tir_${pos.id}`;
+  const tirRaw = db.prepare('SELECT value FROM agent_state WHERE key = ?').get(tirKey) as any;
+  let tirAcc = { timeInRangeS: 0, lastCheckedAt: pos.opened_at, wasInRange: false };
+  if (tirRaw) {
+    try { tirAcc = JSON.parse(tirRaw.value); } catch { /* keep default */ }
+  }
+  const nowTs = Date.now();
+  if (tirAcc.wasInRange) {
+    tirAcc.timeInRangeS += (nowTs - tirAcc.lastCheckedAt) / 1000;
+  }
+  tirAcc.lastCheckedAt = nowTs;
+  tirAcc.wasInRange = liveData.isInRange;
+  db.prepare('INSERT OR REPLACE INTO agent_state (key, value) VALUES (?, ?)').run(tirKey, JSON.stringify(tirAcc));
 
   if (!liveData.isInRange) {
     await alertOutOfRange(pos.token_symbol, pos.pool_address);
   }
 
+  const redeployCount24h = recentRedeployCount(pos.pool_address, 24);
+
+  // Fetch fresh per-pool detail to surface decay vs entry snapshot.
+  // Best-effort — if the REST call fails we just don't show the deltas.
+  const detail = await fetchPoolDetail(pos.pool_address);
+  const poolDecay = detail ? {
+    organicScoreEntry: pos.organic_score ?? null,
+    organicScoreNow:   detail.organicScore,
+    holdersEntry:      pos.holder_count ?? null,
+    holdersNow:        detail.holderCount,
+    feeTvlEntry:       pos.fee_tvl_ratio ?? null,
+    feeTvlNow:         detail.feeTvlRatio,
+  } : undefined;
+
   const decision = await askHealer(pos, {
-    currentPrice:  liveData.currentPrice,
-    feesEarnedSol: liveData.feesEarnedSol,
-    isInRange:     liveData.isInRange,
+    currentPrice:       liveData.currentPrice,
+    feesEarnedSol:      liveData.feesEarnedSol,
+    isInRange:          liveData.isInRange,
     pnlPct,
+    realizablePnlPct,
+    closeSlippagePct:   liveData.closeSlippagePct,
     hoursOpen,
-    currentTvl:    liveData.currentTvl,
-    currentVolume: liveData.currentVolume,
-    feeTvlRatio:   liveData.feeTvlRatio,
+    currentTvl:         liveData.currentTvl,
+    currentVolume:      liveData.currentVolume,
+    feeTvlRatio:        liveData.feeTvlRatio,
+    redeployCount24h,
+    poolDecay,
   });
 
   logger.info('Healer decision', {
@@ -266,7 +310,9 @@ async function healOnePosition(pos: any): Promise<void> {
   const feeApr = hoursOpen > 0
     ? (totalFees / pos.sol_deployed) * (8760 / hoursOpen) * 100
     : 0;
-  const inRangePct = liveData.isInRange ? 100 : 50;
+
+  const totalSecs  = hoursOpen * 3600;
+  const inRangePct = totalSecs > 0 ? (tirAcc.timeInRangeS / totalSecs) * 100 : 50;
 
   const { pnlSol, pnlPct: realizedPnlPct } = dbClosePosition(pos.id, {
     feesSol:          totalFees,
@@ -276,6 +322,8 @@ async function healOnePosition(pos: any): Promise<void> {
     feeApr,
     timeInRangePct:   inRangePct,
   });
+
+  db.prepare('DELETE FROM agent_state WHERE key = ?').run(tirKey);
 
   // Lesson generation (best-effort)
   try {
@@ -313,7 +361,18 @@ async function healOnePosition(pos: any): Promise<void> {
   if (pnlSol < 0) {
     agentState.consecutiveLosses += 1;
     logger.warn(`Loss streak: ${agentState.consecutiveLosses}/${agentState.maxConsecutiveLosses}`);
-    setPoolCooldown(pos.pool_address, 4);
+
+    // Escalating per-pool cooldown — count includes the loss just recorded.
+    // 1st loss → 4h, 2nd → 24h, 3rd+ → 7d. Stops the "same losing pool redeploys
+    // every 4h" failure mode where one bad pool drains capital across repeats.
+    const losses = poolLossCount(pos.pool_address, 14);
+    const cooldownHours = losses >= 3 ? 168 : losses === 2 ? 24 : 4;
+    setPoolCooldown(pos.pool_address, cooldownHours);
+    logger.warn('Pool cooldown set', {
+      pool: pos.pool_address, symbol: pos.token_symbol,
+      cooldownHours, lossesIn14d: losses,
+    });
+
     if (agentState.consecutiveLosses >= agentState.maxConsecutiveLosses) {
       agentState.isRunning = false;
       logger.error('Circuit breaker triggered — auto-paused after consecutive losses');
@@ -387,19 +446,28 @@ async function main(): Promise<void> {
   }
 
   const recon = await reconcileOpenPositions();
-  if (recon.orphans.length > 0) {
-    logger.warn('Reconciliation found orphan positions', { orphans: recon.orphans });
+  if (recon.orphans.length > 0 || recon.emptyClosed > 0) {
+    logger.warn('Reconciliation results', {
+      orphans: recon.orphans.length,
+      emptyClosed: recon.emptyClosed,
+      rentRecovered: recon.rentRecovered.toFixed(4),
+    });
     try {
-      const lines = recon.orphans.map(o => `• #${o.id} ${o.symbol} — ${o.reason}`).join('\n');
+      const orphanLines = recon.orphans.length > 0
+        ? `Orphans (manual review):\n${recon.orphans.map(o => `• #${o.id} ${o.symbol} — ${o.reason}`).join('\n')}\n`
+        : '';
+      const cleanupLine = recon.emptyClosed > 0
+        ? `Cleaned up ${recon.emptyClosed} untracked empty position(s) — recovered ~${recon.rentRecovered.toFixed(3)} SOL rent.`
+        : '';
       const TelegramBot = (await import('node-telegram-bot-api')).default;
       const bot = new TelegramBot(config.telegramToken, { polling: false });
       await bot.sendMessage(
         config.telegramChatId,
-        `⚠️ *Reconciliation*\nFound ${recon.orphans.length} orphan position(s) at boot:\n${lines}\n\nMarked as \`orphan\` — manual review needed.`,
+        `⚠️ *Reconciliation*\n${orphanLines}${cleanupLine}`,
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
-      logger.warn('Failed to send orphan alert', { err });
+      logger.warn('Failed to send reconciliation alert', { err });
     }
   } else if (recon.checked > 0) {
     logger.info('Reconciliation OK', { checked: recon.checked });

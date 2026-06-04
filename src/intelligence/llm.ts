@@ -52,70 +52,139 @@ interface LlmOptions {
   maxTokens?:   number;
 }
 
+const MAX_RETRIES   = 3;
+const RETRY_BASE_MS  = 2000;
+
+const isAnthropic = (model: string) =>
+  model.startsWith('anthropic/') || model.startsWith('claude-');
+
+// OpenRouter accepts a `provider` routing field and Anthropic-style structured
+// content blocks with `cache_control`. Other gateways (sumopod, OpenAI direct,
+// Groq, etc.) reject both. We detect OpenRouter by base URL.
+const isOpenRouter = () => config.llmBaseUrl.includes('openrouter.ai');
+
+function sanitizeBlocks(blocks: ContentBlock[], model: string): ContentBlock[] {
+  // Strip cache_control unless we're going through OpenRouter to an Anthropic
+  // model — that's the only path that understands it.
+  if (isOpenRouter() && isAnthropic(model)) return blocks;
+  return blocks.map(({ cache_control, ...rest }) => rest);
+}
+
+// Some gateways (sumopod via litellm) want `content: "string"` for messages
+// instead of `content: [{type:'text', text:'...'}]`. Collapse blocks to a
+// single string when we're not on a structured-content-friendly provider.
+function blocksToContent(blocks: ContentBlock[]): string | ContentBlock[] {
+  if (isOpenRouter()) return blocks;
+  return blocks.map(b => b.text).join('\n\n');
+}
+
 async function llmCall(opts: LlmOptions): Promise<{
   text:     string;
   toolArgs: Record<string, unknown> | null;
 }> {
   const http = (await import('node-fetch')).default as unknown as typeof fetch;
 
-  const body: Record<string, unknown> = {
-    model:      opts.model,
-    max_tokens: opts.maxTokens ?? 1200,
-    messages: [
-      { role: 'system', content: opts.systemBlocks },
-      { role: 'user',   content: opts.userBlocks   },
-    ],
-  };
+  const makeBody = (): Record<string, unknown> => {
+    const isAnt = isAnthropic(opts.model);
+    const sysBlocks = sanitizeBlocks(opts.systemBlocks, opts.model);
+    const usrBlocks = sanitizeBlocks(opts.userBlocks, opts.model);
 
-  if (opts.tools && opts.tools.length > 0) {
-    body.tools = opts.tools;
-    if (opts.toolChoice) {
-      body.tool_choice = {
-        type: 'function',
-        function: { name: opts.toolChoice },
+    const body: Record<string, unknown> = {
+      model:      opts.model,
+      max_tokens: opts.maxTokens ?? 1200,
+      messages: [
+        { role: 'system', content: blocksToContent(sysBlocks) },
+        { role: 'user',   content: blocksToContent(usrBlocks) },
+      ],
+    };
+
+    if (opts.tools && opts.tools.length > 0) {
+      body.tools = opts.tools;
+      if (opts.toolChoice) {
+        // OpenAI tool_choice shape — OpenRouter normalizes to each provider's
+        // native format. Avoids Bedrock's strict parser rejecting the
+        // Anthropic-native `type: 'tool'` form when OpenRouter doesn't
+        // translate it. (`type: 'tool_use'` was wrong outright — that's the
+        // response block type, not a request field.)
+        body.tool_choice = { type: 'function', function: { name: opts.toolChoice } };
+      }
+    }
+
+    // Force OpenRouter to pick a provider that actually supports the
+    // parameters we send (tools, tool_choice). Without this, Bedrock can
+    // be picked and reject the call. Also prefer Anthropic direct first
+    // for Claude models — it's most permissive on tool-use requests.
+    // Skipped on non-OpenRouter gateways (they reject unknown fields).
+    if (isOpenRouter()) {
+      body.provider = {
+        require_parameters: true,
+        ...(isAnt ? { order: ['anthropic', 'amazon-bedrock'], allow_fallbacks: true } : {}),
       };
     }
-  }
 
-  const res = await http(`${config.llmBaseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${config.openrouterKey}`,
-      'HTTP-Referer':  'https://nova-lp-agent.local',
-      'X-Title':       'Nova LP Agent',
-    },
-    body: JSON.stringify(body),
-  });
+    return body;
+  };
 
-  if (!res.ok) {
-    throw new Error(`LLM ${res.status}: ${await res.text()}`);
-  }
+  let lastErr: Error | null = null;
 
-  const data    = await res.json() as any;
-  const choice  = data.choices?.[0]?.message;
-  const text    = typeof choice?.content === 'string' ? choice.content : '';
-  const tcalls  = choice?.tool_calls ?? [];
-  let toolArgs: Record<string, unknown> | null = null;
-  if (tcalls.length > 0) {
-    const raw = tcalls[0]?.function?.arguments ?? '';
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      toolArgs = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const res = await http(`${config.llmBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': `Bearer ${config.openrouterKey}`,
+          'HTTP-Referer':  'https://nova-lp-agent.local',
+          'X-Title':       'Nova LP Agent',
+        },
+        body: JSON.stringify(makeBody()),
+      });
+
+      const respText = await res.text();
+
+      if (!res.ok) {
+        throw new Error(`LLM ${res.status}: ${respText.slice(0, 200)}`);
+      }
+
+      const data    = JSON.parse(respText);
+      const choice  = data.choices?.[0]?.message;
+      const text    = typeof choice?.content === 'string' ? choice.content : '';
+      const tcalls  = choice?.tool_calls ?? [];
+      let toolArgs: Record<string, unknown> | null = null;
+      if (tcalls.length > 0) {
+        const raw = tcalls[0]?.function?.arguments ?? '';
+        try {
+          toolArgs = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        } catch (err) {
+          logger.warn('Tool args JSON parse failed', { raw: String(raw).slice(0, 200) });
+        }
+      }
+
+      const usage = data.usage ?? {};
+      if (usage.prompt_tokens_details?.cached_tokens > 0) {
+        logger.debug('LLM cache hit', {
+          cached:  usage.prompt_tokens_details.cached_tokens,
+          prompt:  usage.prompt_tokens,
+          model:   opts.model,
+        });
+      }
+
+      return { text, toolArgs };
+
     } catch (err) {
-      logger.warn('Tool args JSON parse failed', { raw, err });
+      lastErr = err as Error;
+      if (attempt < MAX_RETRIES) {
+        const delay = RETRY_BASE_MS * Math.pow(2, attempt - 1);
+        logger.warn(`LLM attempt ${attempt}/${MAX_RETRIES} failed, retrying in ${delay}ms`, {
+          model: opts.model,
+          err: (err as Error).message.slice(0, 120),
+        });
+        await new Promise(r => setTimeout(r, delay));
+      }
     }
   }
 
-  const usage = data.usage ?? {};
-  if (usage.prompt_tokens_details?.cached_tokens > 0) {
-    logger.debug('LLM cache hit', {
-      cached:  usage.prompt_tokens_details.cached_tokens,
-      prompt:  usage.prompt_tokens,
-      model:   opts.model,
-    });
-  }
-
-  return { text, toolArgs };
+  throw lastErr ?? new Error('LLM call failed after retries');
 }
 
 // ── Tool schemas ───────────────────────────────────────────────
@@ -180,12 +249,14 @@ function hunterStaticRules(): string {
 - BID_ASK: concentrated at the edges, good for volatile pools / passive DCA
 
 === HARD RULES ===
-- Fee/TVL ratio < 5% → usually SKIP (fee inefficiency)
+- Fee/TVL lower than 5% → SKIP (not enough fee revenue to justify IL risk)
+- Fee/TVL between 5% and 60% → good range, DEPLOY if Nova score is high
+- Fee/TVL above 60% → consider DEPLOY but check if pool is too volatile (high ratio = high risk)
 - Nova score < 50 → SKIP
 - Bundle % > 40% → SKIP (supply manipulation)
 - Risk HIGH → only deploy if confidence > 0.85 and there's a relevant lesson
 - Max deploy per position = min(${config.maxPositionSol} SOL, 20% of total capital)
-- Prefer fresh pools (high volume, growing holders) over stale pools
+- Prefer fresh pools with active trading over stale ones
 
 Output via tool call \`submit_deploy_decisions\`. The order of decisions MUST match the order of CANDIDATE blocks in the user message.`;
 }
@@ -196,16 +267,31 @@ function healerStaticRules(): string {
 === DECISIONS ===
 - STAY: position is healthy, let it keep earning
 - CLAIM_FEES: harvest accrued fees but keep holding the position
-- CLOSE: close the position (stop loss / take profit / pool death)
-- REDEPLOY: close and re-deploy to a new range (out of range for too long)
+- CLOSE: close the position (stop loss / take profit / pool death / churning)
+- REDEPLOY: close and re-deploy to a new range (only when pool is still healthy)
 
 === HARD RULES ===
-- PnL < -${(config.stopLossPct * 100).toFixed(0)}% (includes IL) → CLOSE (stop loss)
-- PnL > +${(config.takeProfitPct * 100).toFixed(0)}% → CLOSE (take profit)
-- Out of range > 2 hours → REDEPLOY to a new range around the current price
-- Fee/TVL ratio dropped < 2% while in-range → consider CLOSE (pool dying)
-- Fees > 0.01 SOL accumulated and in-range → CLAIM_FEES then STAY
-- Position open < 1 hour → bias toward STAY unless stop-loss triggers
+- PnL below -${(config.stopLossPct * 100).toFixed(0)} percent (includes IL) → CLOSE (stop loss)
+- PnL above +${(config.takeProfitPct * 100).toFixed(0)} percent → CLOSE (take profit)
+
+REDEPLOY is expensive — every redeploy realizes IL plus pays slippage twice. Use it sparingly:
+- Out of range more than 2 hours AND PnL above -5 percent AND Fee/TVL above 8 percent → REDEPLOY to a new range around the current price
+- Out of range more than 2 hours AND (PnL at or below -5 percent OR Fee/TVL at or below 8 percent) → CLOSE (do not redeploy a losing or dying pool — cut losses)
+- Pool already redeployed 1 or more times in last 24 hours → CLOSE rather than REDEPLOY again (the pool is churning — repeated redeploys compound IL)
+
+Realizable value vs mid-price PnL:
+- Two PnL numbers are shown: PnL at mid-price (optimistic) and PnL after close slippage (realistic)
+- If close slippage is above ${(config.maxCloseSlippagePct * 100).toFixed(0)} percent AND mid-price PnL is above the stop-loss threshold → STAY (selling now would crystallize MORE loss than the position is currently down — wait for liquidity to return)
+- For CLOSE / REDEPLOY decisions, weight the realistic PnL more than mid-price PnL
+
+Fee/TVL guidance (values are percent — compare directly, e.g. 76.89 means 76.89%):
+- Fee/TVL below 2 percent while in-range → consider CLOSE (pool dying)
+- Fee/TVL between 2 and 10 percent → acceptable but not great, STAY only if PnL positive
+- Fee/TVL above 10 percent → good fee generation, bias toward STAY
+
+Other:
+- Fees above 0.01 SOL accumulated and in-range → CLAIM_FEES then STAY
+- Position open less than 1 hour → bias toward STAY unless stop-loss triggers
 
 Output via tool call \`submit_heal_decision\`.`;
 }
@@ -252,7 +338,7 @@ Symbol         : ${c.tokenSymbol}
 Nova Score     : ${c.novaScore.toFixed(1)}/100
 Risk Level     : ${c.riskLevel}
 Pool Address   : ${c.poolAddress}
-Fee/TVL Ratio  : ${(c.feeTvlRatio * 100).toFixed(2)}%
+Fee/TVL Ratio  : ${(c.feeTvlRatio).toFixed(2)}% (daily — HIGHER = MORE fees for LP)
 Volume 24h     : $${c.volume24hUsd.toLocaleString()}
 TVL            : $${c.tvlUsd.toLocaleString()}
 Organic Score  : ${c.organicScore.toFixed(0)}/100
@@ -300,14 +386,25 @@ Bundle %       : ${c.bundlePct.toFixed(1)}%
 // ── HEALER ─────────────────────────────────────────────────────
 
 export async function askHealer(position: any, liveData: {
-  currentPrice:  number;
-  feesEarnedSol: number;
-  isInRange:     boolean;
-  pnlPct:        number;
-  hoursOpen:     number;
-  currentTvl:    number;
-  currentVolume: number;
-  feeTvlRatio:   number;
+  currentPrice:       number;
+  feesEarnedSol:      number;
+  isInRange:          boolean;
+  pnlPct:             number;
+  realizablePnlPct?:  number;
+  closeSlippagePct?:  number;
+  hoursOpen:          number;
+  currentTvl:         number;
+  currentVolume:      number;
+  feeTvlRatio:        number;
+  redeployCount24h?:  number;
+  poolDecay?: {
+    organicScoreEntry: number | null;
+    organicScoreNow:   number;
+    holdersEntry:      number | null;
+    holdersNow:        number;
+    feeTvlEntry:       number | null;
+    feeTvlNow:         number;
+  };
 }): Promise<HealDecision> {
 
   const lessons = getLessons('HEALER', 6);
@@ -329,16 +426,25 @@ Opened       : ${new Date(position.opened_at).toISOString()}
 Duration     : ${liveData.hoursOpen.toFixed(1)} hours
 
 === LIVE STATUS ===
-In Range     : ${liveData.isInRange ? 'YES' : 'NO — not earning fees'}
-PnL (incl IL): ${liveData.pnlPct.toFixed(2)}%
-Fees earned  : ${liveData.feesEarnedSol.toFixed(6)} SOL
-Current price: ${liveData.currentPrice.toFixed(8)}
+In Range          : ${liveData.isInRange ? 'YES' : 'NO — not earning fees'}
+PnL mid-price     : ${liveData.pnlPct.toFixed(2)} percent  (optimistic — assumes zero slippage on close)
+PnL realizable    : ${(liveData.realizablePnlPct ?? liveData.pnlPct).toFixed(2)} percent  (after swapping token side back to SOL)
+Close slippage    : ${(liveData.closeSlippagePct ?? 0).toFixed(2)} percent  (price impact of liquidating now)
+Fees earned       : ${liveData.feesEarnedSol.toFixed(6)} SOL
+Current price     : ${liveData.currentPrice.toFixed(8)}
 
 === POOL HEALTH ===
 Current TVL  : $${liveData.currentTvl.toLocaleString()}
 Volume 24h   : $${liveData.currentVolume.toLocaleString()}
-Fee/TVL ratio: ${(liveData.feeTvlRatio * 100).toFixed(2)}%
-
+Fee/TVL ratio: ${(liveData.feeTvlRatio).toFixed(2)} percent
+Redeploys 24h: ${liveData.redeployCount24h ?? 0} (this pool, last 24 hours)
+${liveData.poolDecay ? `
+=== POOL DECAY (entry → now) ===
+Organic score: ${liveData.poolDecay.organicScoreEntry ?? '?'} → ${liveData.poolDecay.organicScoreNow.toFixed(0)}
+Holders      : ${liveData.poolDecay.holdersEntry ?? '?'} → ${liveData.poolDecay.holdersNow}
+Fee/TVL      : ${liveData.poolDecay.feeTvlEntry?.toFixed(2) ?? '?'} → ${liveData.poolDecay.feeTvlNow.toFixed(2)} percent
+(Significant decay = pool dying — bias toward CLOSE)
+` : ''}
 === LESSONS ===
 ${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'No lessons yet.'}`,
     },
