@@ -3,7 +3,7 @@ dotenv.config();
 
 function req(k: string): string {
   const v = process.env[k];
-  if (!v) throw new Error(`Missing xxenv var: ${k}`);
+  if (!v) throw new Error(`Missing xxxxxxxenv var: ${k}`);
   return v;
 }
 function opt(k: string, d: string): string { return process.env[k] ?? d; }
