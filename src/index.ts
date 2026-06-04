@@ -115,7 +115,7 @@ async function runHunterCycle(): Promise<void> {
 
       // Single gate: trust the LLM. novaScore informs the prompt but
       // doesn't block on its own.
-      if (decision.action !== 'DEPLOY' || decision.confidence < 0.65) {
+      if (decision.action !== 'DEPLOY' || decision.confidence < 0.85) {
         logger.info(`Skip ${candidate.tokenSymbol}`, {
           reason: decision.reasoning.slice(0, 80),
           confidence: decision.confidence,
