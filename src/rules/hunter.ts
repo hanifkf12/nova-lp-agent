@@ -6,7 +6,10 @@ import { logger } from '../utils/logger';
 
 export function chooseStrategy(pool: PoolCandidate): 'spot' | 'curve' | 'bid_ask' {
   if (pool.priceChange24h > 30) return 'bid_ask';
-  if (pool.feeTvlRatio > 0.25) return 'curve';
+  // feeTvlRatio from Meteora is annualized APR (e.g., 24 = 2400%)
+  // Normalize to daily ratio for strategy selection
+  const dailyFeeTvl = (pool.feeTvlRatio ?? 0) / 365;
+  if (dailyFeeTvl > 0.25) return 'curve';
   return 'spot';
 }
 

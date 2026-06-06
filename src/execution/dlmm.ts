@@ -309,7 +309,7 @@ export async function deployPosition(
     const binStep = knownBinStep ?? bs;
     const factor = Math.pow(1 + binStep / 10000, binRange - 1);
     const priceRangeMin = entryPrice / factor;
-    const priceRangeMax = entryPrice;
+    const priceRangeMax = entryPrice * factor;
     logger.info('[DRY RUN] Would deploy position', {
       poolAddress, strategy, solAmount, binRange, binStep,
       entryPrice, priceRangeMin, priceRangeMax,

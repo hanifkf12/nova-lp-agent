@@ -1,6 +1,7 @@
 import { config } from '../config';
 import { isPoolOnCooldown } from '../db';
 import { logger } from '../utils/logger';
+import { fetchGmgnTrending, fetchGmgnTokenInfo } from './gmgn';
 
 const DISCOVERY_API = config.meteoraDlmmApi;
 const BIRDEYE_API   = 'https://public-api.birdeye.so';
@@ -52,6 +53,17 @@ export interface PoolCandidate {
   isWash:        boolean;
   isRugpull:     boolean;
 
+  // GMGN risk signals (optional, 0 if unavailable)
+  gmgnRugRatio?:              number;
+  gmgnInsiderHoldRate?:       number;
+  gmgnSniperCount?:           number;
+  gmgnSmartDegenCount?:       number;
+  gmgnBundlerVolumeRate?:     number;
+  gmgnRatTraderVolumeRate?:   number;
+  gmgnMintDisabled?:          boolean;
+  gmgnTop10HolderRate?:       number;
+  gmgnBurnRatio?:             number;
+
   // Computed
   novaScore:     number;
   riskLevel:     'LOW' | 'MEDIUM' | 'HIGH';
@@ -62,25 +74,25 @@ export interface PoolCandidate {
 function computeNovaScore(pool: Partial<PoolCandidate>): number {
   let score = 0;
 
-  // 1. Fee efficiency (0–30 pts) — paling penting
+  // 1. Fee efficiency (0–25 pts)
   const feeRatio = pool.feeTvlRatio ?? 0;
-  score += Math.min(feeRatio * 200, 30);
+  score += Math.min(feeRatio * 167, 25);
 
-  // 2. Volume (0–20 pts)
+  // 2. Volume (0–15 pts)
   const vol = pool.volume24hUsd ?? 0;
-  if (vol > 500_000) score += 20;
-  else if (vol > 200_000) score += 15;
-  else if (vol > 50_000) score += 10;
-  else if (vol > 20_000) score += 5;
+  if (vol > 500_000) score += 15;
+  else if (vol > 200_000) score += 12;
+  else if (vol > 50_000) score += 8;
+  else if (vol > 20_000) score += 4;
 
-  // 3. Organic score (0–20 pts)
-  score += Math.min((pool.organicScore ?? 0) / 5, 20);
+  // 3. Organic score (0–15 pts)
+  score += Math.min((pool.organicScore ?? 0) / 6.7, 15);
 
-  // 4. TVL sweet spot (0–15 pts) — tidak terlalu besar, tidak terlalu kecil
+  // 4. TVL sweet spot (0–10 pts)
   const tvl = pool.tvlUsd ?? 0;
-  if (tvl >= 20_000 && tvl <= 100_000) score += 15;
-  else if (tvl >= 10_000 && tvl <= 200_000) score += 10;
-  else if (tvl >= config.screening.minTvl) score += 5;
+  if (tvl >= 20_000 && tvl <= 100_000) score += 10;
+  else if (tvl >= 10_000 && tvl <= 200_000) score += 7;
+  else if (tvl >= config.screening.minTvl) score += 3;
 
   // 5. Holder count (0–10 pts)
   const holders = pool.holderCount ?? 0;
@@ -89,7 +101,35 @@ function computeNovaScore(pool: Partial<PoolCandidate>): number {
   else if (holders > 200) score += 4;
   else if (holders > 100) score += 2;
 
-  // 6. Penalties
+  // 6. Risk Quality from GMGN signals (0–25 pts)
+  let riskPts = 0;
+
+  // 6a. Rug ratio (0–8 pts) — lower is better
+  const rug = pool.gmgnRugRatio ?? 0.5;
+  riskPts += Math.max(0, 8 - rug * 10);
+
+  // 6b. Insider hold (0–7 pts) — lower is better
+  const insider = pool.gmgnInsiderHoldRate ?? 0.3;
+  riskPts += Math.max(0, 7 - insider * 10);
+
+  // 6c. Smart money (0–5 pts) — more is better
+  const smart = pool.gmgnSmartDegenCount ?? 0;
+  if (smart > 10) riskPts += 5;
+  else if (smart > 5) riskPts += 3;
+  else if (smart > 0) riskPts += 1;
+
+  // 6d. Sniper count (0–3 pts) — fewer is better
+  const snipers = pool.gmgnSniperCount ?? 0;
+  if (snipers === 0) riskPts += 3;
+  else if (snipers < 5) riskPts += 2;
+  else if (snipers < 20) riskPts += 1;
+
+  // 6e. Mint safety (0–2 pts)
+  if (pool.gmgnMintDisabled) riskPts += 2;
+
+  score += riskPts;
+
+  // 7. Penalties
   if (pool.isWash)          score -= 50;
   if (pool.isRugpull)       score -= 100;
 
@@ -98,6 +138,8 @@ function computeNovaScore(pool: Partial<PoolCandidate>): number {
 
 function getRiskLevel(pool: Partial<PoolCandidate>): 'LOW' | 'MEDIUM' | 'HIGH' {
   if (pool.isRugpull || pool.isWash) return 'HIGH';
+  if ((pool.gmgnRugRatio ?? 0) > 0.7) return 'HIGH';
+  if ((pool.gmgnInsiderHoldRate ?? 0) > 0.5) return 'HIGH';
   if ((pool.holderCount ?? 0) < 200) return 'MEDIUM';
   return 'LOW';
 }
@@ -156,33 +198,62 @@ async function enrichWithBirdeye(http: typeof fetch, mint: string): Promise<{
 export async function huntPools(): Promise<PoolCandidate[]> {
   const http = (await import('node-fetch')).default as unknown as typeof fetch;
 
-  logger.info('Hunter: scanning Meteora pools...');
+  logger.info('Hunter: scanning pools...');
 
+  // 1. Fetch Meteora pools (primary source)
   let raw: any[];
   try {
     raw = await fetchMeteoraPools(http);
   } catch (err) {
-    logger.error('Failed to fetch pools', { err });
-    return [];
+    logger.error('Failed to fetch Meteora pools', { err });
+    raw = [];
+  }
+  logger.info(`Meteora: ${raw.length} raw pools`);
+
+  // 2. Fetch GMGN trending tokens (secondary source)
+  const gmgnTokens = await fetchGmgnTrending(http, 50);
+  logger.info(`GMGN: ${gmgnTokens.length} trending tokens`);
+
+  // 3. Build mint→pool lookup from Meteora
+  const meteoraByMint = new Map<string, any>();
+  for (const p of raw) {
+    const mint = p.token_x?.address;
+    if (mint) meteoraByMint.set(mint, p);
   }
 
-  logger.info(`Hunter: got ${raw.length} raw pools`);
-  if (raw.length > 0) logger.info('Sample:', { 
-    name: raw[0].name, 
-    tvl: raw[0].tvl, 
-    volume: raw[0].volume,
-    feeTvlRatio: raw[0].fee_tvl_ratio,
-    tokenX: raw[0].token_x?.symbol,
-    organicScore: raw[0].token_x?.organic_score,
-    holders: raw[0].base_token_holders,
-  });
+  // 4. Merge: Meteora pools + GMGN tokens that have a Meteora DLMM pool
+  const mergedMints = new Set<string>();
+  const merged: any[] = [];
 
-  const filtered = raw.filter(p => {
+  // Add all Meteora pools
+  for (const p of raw) {
+    const mint = p.token_x?.address;
+    if (mint && !mergedMints.has(mint)) {
+      mergedMints.add(mint);
+      merged.push(p);
+    }
+  }
+
+  // Add GMGN trending tokens that have a Meteora DLMM pool (but not already in list)
+  for (const t of gmgnTokens) {
+    if (mergedMints.has(t.address)) continue;
+    const meteoraPool = meteoraByMint.get(t.address);
+    if (meteoraPool) {
+      mergedMints.add(t.address);
+      merged.push(meteoraPool);
+    }
+  }
+
+  logger.info(`After merge: ${merged.length} unique tokens`);
+
+  // 5. Filter cooldown + basic checks
+  const filtered = merged.filter(p => {
     const mint = p.token_x?.address;
     return mint && !isPoolOnCooldown(p.pool_address);
   });
   logger.info(`After cooldown filter: ${filtered.length}`);
 
+  // 6. Enrich top candidates with Birdeye + GMGN risk signals
   const top = filtered.slice(0, 15);
   const enriched = await Promise.all(top.map(async (p): Promise<PoolCandidate | null> => {
     const mint    = p.token_x?.address;
@@ -191,7 +262,11 @@ export async function huntPools(): Promise<PoolCandidate[]> {
 
     if (!mint || !address) return null;
 
+    // Birdeye enrichment
     const bird = await enrichWithBirdeye(http, mint);
+
+    // GMGN risk enrichment
+    const gmgn = await fetchGmgnTokenInfo(http, mint);
 
     const candidate: PoolCandidate = {
       poolAddress:   address,
@@ -208,6 +283,16 @@ export async function huntPools(): Promise<PoolCandidate[]> {
       mcapUsd:       bird.mcapUsd    || parseFloat(p.token_x?.market_cap ?? '0'),
       isWash:        false,
       isRugpull:     p.is_blacklisted ?? false,
+      // GMGN risk signals
+      gmgnRugRatio:              gmgn?.rugRatio,
+      gmgnInsiderHoldRate:       gmgn?.insiderHoldRate,
+      gmgnSniperCount:           gmgn?.sniperCount,
+      gmgnSmartDegenCount:       gmgn?.smartDegenCount,
+      gmgnBundlerVolumeRate:     gmgn?.bundlerVolumeRate,
+      gmgnRatTraderVolumeRate:   gmgn?.ratTraderVolumeRate,
+      gmgnMintDisabled:          gmgn?.mintDisabled,
+      gmgnTop10HolderRate:       gmgn?.top10HolderRate,
+      gmgnBurnRatio:             gmgn?.burnRatio,
       novaScore:     0,
       riskLevel:     'MEDIUM',
     };

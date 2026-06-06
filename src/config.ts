@@ -22,6 +22,7 @@ export const config = {
   openrouterKey: req('OPENROUTER_API_KEY'),
   heliusKey:     opt('HELIUS_API_KEY', ''),
   birdeyeKey:    opt('BIRDEYE_API_KEY', ''),
+  gmgnApiKey:    opt('GMGN_API_KEY', ''),
   llmBaseUrl:    opt('LLM_BASE_URL', 'https://openrouter.ai/api/v1'),
   hunterModel:   opt('HUNTER_MODEL', 'anthropic/claude-sonnet-4.6'),
   healerModel:   opt('HEALER_MODEL', 'anthropic/claude-haiku-4.5'),
