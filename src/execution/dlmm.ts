@@ -336,6 +336,16 @@ export async function deployPosition(
     const entryPriceNum = safePriceFromLamport(dlmmPool, activeBin.price);
     const activeBinId   = Number(activeBin.binId);
 
+    // Pre-deploy liquidity check — skip thin pools
+    const { bins: binsAround } = await dlmmPool.getBinsAroundActiveBin(binRange, binRange);
+    const totalBinLiquidity = binsAround.reduce(
+      (sum: number, b: any) => sum + Number(b.xAmount ?? 0) + Number(b.yAmount ?? 0), 0
+    );
+    const liquiditySol = totalBinLiquidity / 1e9;
+    if (liquiditySol < solAmount * 5) {
+      return { success: false, error: `Pool liquidity ${liquiditySol.toFixed(2)} SOL too thin for ${solAmount} SOL deploy` };
+    }
+
     let minBinId: number, maxBinId: number;
     if (sides.solIsX) {
       minBinId = activeBinId;
@@ -774,7 +784,8 @@ export async function getLivePositionData(
       liveFeeRate = poolHealth.currentFeeRate;
     }
 
-    // Fee accrual: use live dynamic fee when available, else fallback to snapshot
+    // Fee accrual: fee_tvl_ratio from Meteora is annualized (APR-equivalent).
+    // Convert to daily yield: divide by 365. Cap at 0.5% daily (182.5% APR).
     const stateKey = `dry_pos:${pos.id}`;
     const rawState = getState(stateKey);
     const state    = rawState
@@ -785,9 +796,11 @@ export async function getLivePositionData(
     if (isInRange) {
       let dailyYield: number;
       if (liveFeeRate !== null && liveFeeRate > 0) {
-        dailyYield = Math.min(liveFeeRate, 0.5);
+        // liveFeeRate is dynamic fee in bps → convert to annualized daily
+        dailyYield = Math.min(liveFeeRate / 10000 / 365, 0.005);
       } else if (snapFeeTvl > 0) {
-        dailyYield = Math.min(snapFeeTvl / 100, 0.5);
+        // snapFeeTvl is annualized percent (e.g. 12.5 = 12.5% APR)
+        dailyYield = Math.min(snapFeeTvl / 100 / 365, 0.005);
       } else {
         dailyYield = 0;
       }

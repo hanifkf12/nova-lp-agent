@@ -49,17 +49,12 @@ export interface PoolCandidate {
   mcapUsd:       number;
   currentPrice:  number;
   priceChange24h: number;
-  bundlePct:     number;
   isWash:        boolean;
   isRugpull:     boolean;
-  kolPresent:    boolean;
-  whalePresent:  boolean;
-  deployerAddress?: string;
 
   // Computed
-  novaScore:     number;   // 0–100 composite score
+  novaScore:     number;
   riskLevel:     'LOW' | 'MEDIUM' | 'HIGH';
-  recommendation: string;
 }
 
 // ── Multi-layer pool scoring ───────────────────────────────────
@@ -94,23 +89,16 @@ function computeNovaScore(pool: Partial<PoolCandidate>): number {
   else if (holders > 200) score += 4;
   else if (holders > 100) score += 2;
 
-  // 6. KOL / whale bonus (+5)
-  if (pool.kolPresent)   score += 3;
-  if (pool.whalePresent) score += 2;
-
-  // 7. Penalties
+  // 6. Penalties
   if (pool.isWash)          score -= 50;
   if (pool.isRugpull)       score -= 100;
-  if ((pool.bundlePct ?? 0) > 30) score -= 15;
-  if ((pool.bundlePct ?? 0) > 50) score -= 20;
 
   return Math.max(0, Math.min(100, score));
 }
 
 function getRiskLevel(pool: Partial<PoolCandidate>): 'LOW' | 'MEDIUM' | 'HIGH' {
   if (pool.isRugpull || pool.isWash) return 'HIGH';
-  if ((pool.bundlePct ?? 0) > 40) return 'HIGH';
-  if ((pool.bundlePct ?? 0) > 20 || (pool.holderCount ?? 0) < 200) return 'MEDIUM';
+  if ((pool.holderCount ?? 0) < 200) return 'MEDIUM';
   return 'LOW';
 }
 
@@ -163,69 +151,6 @@ async function enrichWithBirdeye(http: typeof fetch, mint: string): Promise<{
   }
 }
 
-// ── Whale/KOL detection via Helius ────────────────────────────
-
-const decimalsCache = new Map<string, number>();
-
-async function getTokenDecimals(http: typeof fetch, mint: string): Promise<number> {
-  if (decimalsCache.has(mint)) return decimalsCache.get(mint)!;
-  if (!config.heliusKey) return 0;
-
-  try {
-    const res = await http(
-      `https://api.helius.xyz/v0/token-metadata?api-key=${config.heliusKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mintAccounts: [mint] }),
-      }
-    );
-    if (!res.ok) return 0;
-    const meta = (await res.json()) as any[];
-    const dec = meta[0]?.onChainMetadata?.metadata?.data?.decimals ?? 0;
-    decimalsCache.set(mint, dec);
-    return dec;
-  } catch {
-    return 0;
-  }
-}
-
-async function checkWhaleActivity(http: typeof fetch, mint: string): Promise<{
-  whalePresent: boolean;
-  kolPresent:   boolean;
-  bundlePct:    number;
-}> {
-  if (!config.heliusKey) return { whalePresent: false, kolPresent: false, bundlePct: 0 };
-
-  try {
-    const decimals = await getTokenDecimals(http, mint);
-
-    const res = await http(
-      `https://api.helius.xyz/v0/addresses/${mint}/transactions?api-key=${config.heliusKey}&limit=20&type=SWAP`
-    );
-    if (!res.ok) return { whalePresent: false, kolPresent: false, bundlePct: 0 };
-    const txs = await res.json() as any[];
-
-    const recentBig = txs.filter((tx: any) => {
-      const age   = Date.now() - (tx.timestamp ?? 0) * 1000;
-      const value = (tx.tokenTransfers ?? []).reduce((s: number, t: any) => {
-        let amount = t.tokenAmount ?? 0;
-        if (decimals > 0) amount = amount / Math.pow(10, decimals);
-        return s + amount;
-      }, 0);
-      return age < 3600000 && value > 1; // > 1 token in last hour
-    });
-
-    return {
-      whalePresent: recentBig.length > 2,
-      kolPresent:   false,
-      bundlePct:    0,
-    };
-  } catch {
-    return { whalePresent: false, kolPresent: false, bundlePct: 0 };
-  }
-}
-
 // ── Main hunter function ──────────────────────────────────────
 
 export async function huntPools(): Promise<PoolCandidate[]> {
@@ -266,10 +191,7 @@ export async function huntPools(): Promise<PoolCandidate[]> {
 
     if (!mint || !address) return null;
 
-    const [bird, whale] = await Promise.all([
-      enrichWithBirdeye(http, mint),
-      checkWhaleActivity(http, mint),
-    ]);
+    const bird = await enrichWithBirdeye(http, mint);
 
     const candidate: PoolCandidate = {
       poolAddress:   address,
@@ -284,25 +206,15 @@ export async function huntPools(): Promise<PoolCandidate[]> {
       priceChange24h: bird.priceChange24h,
       holderCount:   bird.holderCount || parseInt(p.base_token_holders ?? p.token_x?.holders ?? '0'),
       mcapUsd:       bird.mcapUsd    || parseFloat(p.token_x?.market_cap ?? '0'),
-      bundlePct:     whale.bundlePct,
       isWash:        false,
       isRugpull:     p.is_blacklisted ?? false,
-      kolPresent:    whale.kolPresent,
-      whalePresent:  whale.whalePresent,
-      deployerAddress: '',
       novaScore:     0,
       riskLevel:     'MEDIUM',
-      recommendation: '',
     };
 
     // Compute composite score
     candidate.novaScore     = computeNovaScore(candidate);
     candidate.riskLevel     = getRiskLevel(candidate);
-    candidate.recommendation = candidate.novaScore >= 65
-      ? `Deploy ${config.lpStrategy} strategy. High fee efficiency.`
-      : candidate.novaScore >= 45
-      ? 'Monitor — marginal opportunity, wait for better entry.'
-      : 'Skip — does not meet quality threshold.';
 
     return candidate;
   }));

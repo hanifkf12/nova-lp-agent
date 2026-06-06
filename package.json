@@ -11,7 +11,6 @@
     "screen": "ts-node src/cli.ts screen",
     "stats": "ts-node src/cli.ts stats",
     "positions": "ts-node src/cli.ts positions",
-    "lessons": "ts-node src/cli.ts lessons",
     "backtest": "ts-node src/cli.ts backtest"
   },
   "dependencies": {

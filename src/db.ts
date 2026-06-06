@@ -98,29 +98,10 @@ export function initDB(): void {
       cooldown_until INTEGER DEFAULT 0
     );
 
-    -- Whale/smart wallet yang ditrack
-    CREATE TABLE IF NOT EXISTS smart_wallets (
-      address         TEXT PRIMARY KEY,
-      label           TEXT,
-      win_rate_pct    REAL,
-      avg_hold_hours  REAL,
-      total_positions INTEGER DEFAULT 0,
-      last_seen       INTEGER,
-      source          TEXT    -- manual | auto_discovered
-    );
-
     -- State agent
     CREATE TABLE IF NOT EXISTS agent_state (
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
-    );
-
-    -- Screening thresholds yang berevolusi
-    CREATE TABLE IF NOT EXISTS threshold_history (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp   INTEGER NOT NULL,
-      reason      TEXT,
-      thresholds  TEXT    -- JSON snapshot
     );
 
     -- Backtest snapshots for strategy optimization
@@ -171,9 +152,6 @@ export interface PositionInsert {
   organicScore:   number;
   holderCount:    number;
   mcapUsd:        number;
-  whalePresent:   boolean;
-  kolPresent:     boolean;
-  bundlePct:      number;
   llmReasoning:   string;
   llmConfidence:  number;
   deployScore:    number;
@@ -186,21 +164,17 @@ export function insertPosition(p: PositionInsert): number {
       opened_at, pool_address, token_mint, token_symbol, bin_step, strategy,
       sol_deployed, entry_price, price_range_min, price_range_max, bin_count,
       tvl_usd, volume_24h_usd, fee_tvl_ratio, organic_score, holder_count,
-      mcap_usd, whale_present, kol_present, bundle_pct,
-      llm_reasoning, llm_confidence, deploy_score, position_pubkey, status
+      mcap_usd, llm_reasoning, llm_confidence, deploy_score, position_pubkey, status
     ) VALUES (
       @openedAt, @poolAddress, @tokenMint, @tokenSymbol, @binStep, @strategy,
       @solDeployed, @entryPrice, @priceRangeMin, @priceRangeMax, @binCount,
       @tvlUsd, @volume24hUsd, @feeTvlRatio, @organicScore, @holderCount,
-      @mcapUsd, @whalePresent, @kolPresent, @bundlePct,
-      @llmReasoning, @llmConfidence, @deployScore, @positionPubkey, 'open'
+      @mcapUsd, @llmReasoning, @llmConfidence, @deployScore, @positionPubkey, 'open'
     )
   `);
   const r = stmt.run({
     openedAt: Date.now(),
     ...p,
-    whalePresent: p.whalePresent ? 1 : 0,
-    kolPresent:   p.kolPresent   ? 1 : 0,
   });
   return r.lastInsertRowid as number;
 }
@@ -302,13 +276,13 @@ export function poolLossCount(poolAddress: string, days = 14): number {
   return row?.n ?? 0;
 }
 
-// Count positions on a pool that closed via REDEPLOY in the last N hours.
-// Used by the healer to refuse re-redeploying into a churning pool.
-export function recentRedeployCount(poolAddress: string, hours = 24): number {
+// Count all positions opened on a pool in the last N hours (regardless of outcome).
+// Used to prevent repeated deployments to the same pool.
+export function deployCountRecent(poolAddress: string, hours = 168): number {
   const since = Date.now() - hours * 3600000;
   const row = db.prepare(`
     SELECT COUNT(*) as n FROM positions
-    WHERE pool_address = ? AND status = 'closed' AND exit_reason = 'redeploy' AND closed_at > ?
+    WHERE pool_address = ? AND opened_at > ?
   `).get(poolAddress, since) as any;
   return row?.n ?? 0;
 }

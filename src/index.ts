@@ -4,13 +4,15 @@ import { logger } from './utils/logger';
 import { refreshSolPriceUsd } from './utils/solPrice';
 import {
   initDB, insertPosition, closePosition as dbClosePosition,
-  getOpenPositions, addLesson, setState,
-  setPoolCooldown, poolLossCount, recentRedeployCount,
+  getOpenPositions, setState,
+  setPoolCooldown, poolLossCount, deployCountRecent,
   addFeesClaimed,
   db,
 } from './db';
-import { huntPools, fetchPoolDetail } from './screening/hunter';
-import { askHunterBatch, askHealer, deriveLesson } from './intelligence/llm';
+import { huntPools } from './screening/hunter';
+import { hunterDecisions } from './rules/hunter';
+import { hardRuleDecision } from './rules/healer';
+import { askHealer } from './intelligence/llm';
 import {
   getSolBalance, deployPosition, getConnection, rotateRpc,
   claimFees, closePosition as execClose,
@@ -24,6 +26,7 @@ import {
 
 const agentState = {
   isRunning: true,
+  closeAll: false,
   consecutiveLosses: 0,
   maxConsecutiveLosses: 3,
 };
@@ -99,8 +102,12 @@ async function runHunterCycle(): Promise<void> {
       return;
     }
 
-    const batch     = candidates.slice(0, 3);
-    const decisions = await askHunterBatch(batch, openPositions.length, solBalance);
+    // Diversification: no two positions on the same token
+    const openMints = new Set(openPositions.map(p => p.token_mint));
+    const uniqueCandidates = candidates.filter(c => !openMints.has(c.tokenMint));
+
+    const batch     = uniqueCandidates.slice(0, 3);
+    const decisions = hunterDecisions(batch, openPositions.length, solBalance);
 
     let openCount = openPositions.length;
     for (let i = 0; i < decisions.length && i < batch.length; i++) {
@@ -166,9 +173,6 @@ async function runHunterCycle(): Promise<void> {
         organicScore:   candidate.organicScore,
         holderCount:    candidate.holderCount,
         mcapUsd:        candidate.mcapUsd,
-        whalePresent:   candidate.whalePresent,
-        kolPresent:     candidate.kolPresent,
-        bundlePct:      candidate.bundlePct,
         llmReasoning:   decision.reasoning,
         llmConfidence:  decision.confidence,
         deployScore:    candidate.novaScore,
@@ -243,25 +247,30 @@ async function healOnePosition(pos: any): Promise<void> {
   tirAcc.wasInRange = liveData.isInRange;
   db.prepare('INSERT OR REPLACE INTO agent_state (key, value) VALUES (?, ?)').run(tirKey, JSON.stringify(tirAcc));
 
+  // Throttle OOR alerts — once per 4 hours per position
   if (!liveData.isInRange) {
-    await alertOutOfRange(pos.token_symbol, pos.pool_address);
+    const lastOorKey = `alert_oor_${pos.id}`;
+    const lastOor = db.prepare('SELECT value FROM agent_state WHERE key = ?').get(lastOorKey) as any;
+    const lastOorTs = lastOor ? Number(lastOor.value) : 0;
+    if (Date.now() - lastOorTs > 4 * 3600000) {
+      await alertOutOfRange(pos.token_symbol, pos.pool_address);
+      db.prepare('INSERT OR REPLACE INTO agent_state (key, value) VALUES (?, ?)').run(lastOorKey, String(Date.now()));
+    }
   }
 
-  const redeployCount24h = recentRedeployCount(pos.pool_address, 24);
+  // Tier 1: mechanical rules first — no LLM needed for ~70% of cases
+  const hardDecision = hardRuleDecision({
+    pnlPct,
+    realizablePnlPct,
+    isInRange: liveData.isInRange,
+    hoursOpen,
+    feesEarnedSol: liveData.feesEarnedSol,
+    feeTvlRatio: liveData.feeTvlRatio,
+    closeSlippagePct: liveData.closeSlippagePct,
+  });
 
-  // Fetch fresh per-pool detail to surface decay vs entry snapshot.
-  // Best-effort — if the REST call fails we just don't show the deltas.
-  const detail = await fetchPoolDetail(pos.pool_address);
-  const poolDecay = detail ? {
-    organicScoreEntry: pos.organic_score ?? null,
-    organicScoreNow:   detail.organicScore,
-    holdersEntry:      pos.holder_count ?? null,
-    holdersNow:        detail.holderCount,
-    feeTvlEntry:       pos.fee_tvl_ratio ?? null,
-    feeTvlNow:         detail.feeTvlRatio,
-  } : undefined;
-
-  const decision = await askHealer(pos, {
+  // Tier 2: gray zone — ask LLM only if hard rules didn't decide
+  const decision = hardDecision ?? await askHealer(pos, {
     currentPrice:       liveData.currentPrice,
     feesEarnedSol:      liveData.feesEarnedSol,
     isInRange:          liveData.isInRange,
@@ -272,8 +281,6 @@ async function healOnePosition(pos: any): Promise<void> {
     currentTvl:         liveData.currentTvl,
     currentVolume:      liveData.currentVolume,
     feeTvlRatio:        liveData.feeTvlRatio,
-    redeployCount24h,
-    poolDecay,
   });
 
   logger.info('Healer decision', {
@@ -282,6 +289,7 @@ async function healOnePosition(pos: any): Promise<void> {
     urgency: decision.urgency,
     pnlPct: pnlPct.toFixed(2),
     inRange: liveData.isInRange,
+    source: hardDecision ? 'hard-rule' : 'llm',
   });
 
   if (decision.action === 'CLAIM_FEES') {
@@ -295,7 +303,7 @@ async function healOnePosition(pos: any): Promise<void> {
     return;
   }
 
-  if (decision.action !== 'CLOSE' && decision.action !== 'REDEPLOY') return;
+  if (decision.action !== 'CLOSE') return;
 
   const closed = await execClose(pos.pool_address, pos.position_pubkey ?? '');
   if (!closed.success) {
@@ -305,7 +313,7 @@ async function healOnePosition(pos: any): Promise<void> {
 
   // Accumulate all fees: previously claimed (claim_fees decisions) + final
   const totalFees = (pos.fees_claimed_sol ?? 0) + closed.feesClaimedSol;
-  const exitReason = decision.action === 'REDEPLOY' ? 'redeploy' : 'healer_close';
+  const exitReason = 'healer_close';
 
   const feeApr = hoursOpen > 0
     ? (totalFees / pos.sol_deployed) * (8760 / hoursOpen) * 100
@@ -316,7 +324,7 @@ async function healOnePosition(pos: any): Promise<void> {
 
   const { pnlSol, pnlPct: realizedPnlPct } = dbClosePosition(pos.id, {
     feesSol:          totalFees,
-    positionValueSol: liveData.positionValueSol,
+    positionValueSol: liveData.realizableValueSol,
     exitPrice:        closed.exitPrice,
     exitReason,
     feeApr,
@@ -325,28 +333,11 @@ async function healOnePosition(pos: any): Promise<void> {
 
   db.prepare('DELETE FROM agent_state WHERE key = ?').run(tirKey);
 
-  // Lesson generation (best-effort)
-  try {
-    const posData = {
-      ...pos,
-      fees_claimed_sol:  totalFees,
-      fee_apr_pct:       feeApr,
-      time_in_range_pct: inRangePct,
-      exit_reason:       exitReason,
-      pnl_pct:           realizedPnlPct,
-      pnl_sol:           pnlSol,
-    };
-    const lesson = await deriveLesson(posData);
-    if (lesson) {
-      addLesson(
-        decision.action === 'REDEPLOY' ? 'HEALER' : 'GENERAL',
-        lesson,
-        String(pos.id),
-        0.75,
-      );
-    }
-  } catch (err) {
-    logger.warn('Lesson derivation failed', { err });
+  // Deploy-count cooldown: prevent repeated deploys to same pool
+  const deploys = deployCountRecent(pos.pool_address, 168);
+  if (deploys >= 3) {
+    setPoolCooldown(pos.pool_address, 48);
+    logger.warn('Deploy-count cooldown set', { pool: pos.pool_address, deploys, cooldownHours: 48 });
   }
 
   await alertClose({
@@ -384,7 +375,7 @@ async function healOnePosition(pos: any): Promise<void> {
 }
 
 async function runHealerCycle(): Promise<void> {
-  if (!agentState.isRunning) return;
+  if (!agentState.isRunning && !agentState.closeAll) return;
   if (cycleLocks.healer) {
     logger.warn('Healer cycle already running — skipping tick');
     return;
@@ -392,6 +383,29 @@ async function runHealerCycle(): Promise<void> {
   cycleLocks.healer = true;
 
   try {
+    // closeAll: force-close every open position
+    if (agentState.closeAll) {
+      agentState.closeAll = false;
+      const positions = getOpenPositions();
+      logger.warn(`closeAll: closing ${positions.length} positions`);
+      for (const pos of positions) {
+        try {
+          const decision = { action: 'CLOSE' as const, reasoning: 'closeall command', urgency: 'HIGH' as const, newStrategy: null };
+          const closed = await execClose(pos.pool_address, pos.position_pubkey ?? '');
+          if (closed.success) {
+            const totalFees = (pos.fees_claimed_sol ?? 0) + closed.feesClaimedSol;
+            const hoursOpen = (Date.now() - pos.opened_at) / 3600000;
+            const feeApr = hoursOpen > 0 ? (totalFees / pos.sol_deployed) * (8760 / hoursOpen) * 100 : 0;
+            dbClosePosition(pos.id, { feesSol: totalFees, positionValueSol: 0, exitPrice: closed.exitPrice, exitReason: 'closeall', feeApr, timeInRangePct: 0 });
+            await alertClose({ symbol: pos.token_symbol, feesSol: totalFees, pnlPct: 0, exitReason: 'closeall', hoursOpen, feeApr });
+          }
+        } catch (err) {
+          logger.error('closeAll: failed to close position', { id: pos.id, err });
+        }
+      }
+      return;
+    }
+
     const openPositions = getOpenPositions();
     if (openPositions.length === 0) return;
 
@@ -428,7 +442,6 @@ async function main(): Promise<void> {
     maxPositions:   config.maxPositions,
     hunterInterval: config.hunterIntervalMin,
     healerInterval: config.healerIntervalMin,
-    hunterModel:    config.hunterModel,
     healerModel:    config.healerModel,
   });
 

@@ -1,6 +1,4 @@
 import { config } from '../config';
-import { getLessons, buildPerformanceMemory } from '../db';
-import { PoolCandidate } from '../screening/hunter';
 import { logger } from '../utils/logger';
 
 export type AgentRole = 'HUNTER' | 'HEALER' | 'GENERAL';
@@ -189,37 +187,6 @@ async function llmCall(opts: LlmOptions): Promise<{
 
 // ── Tool schemas ───────────────────────────────────────────────
 
-const hunterTool: ToolDef = {
-  type: 'function',
-  function: {
-    name: 'submit_deploy_decisions',
-    description: 'Submit a deploy-or-skip decision for each candidate pool. Order MUST match the order of CANDIDATE blocks in the prompt.',
-    parameters: {
-      type: 'object',
-      properties: {
-        decisions: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              action:      { type: 'string', enum: ['DEPLOY', 'SKIP'] },
-              strategy:    { type: 'string', enum: ['spot', 'curve', 'bid_ask'] },
-              solAmount:   { type: 'number', minimum: 0 },
-              binRange:    { type: 'integer', minimum: 10, maximum: 200 },
-              confidence:  { type: 'number', minimum: 0, maximum: 1 },
-              reasoning:   { type: 'string', maxLength: 280 },
-              learnedFrom: { type: ['string', 'null'] },
-              warnings:    { type: 'array', items: { type: 'string' } },
-            },
-            required: ['action', 'strategy', 'solAmount', 'binRange', 'confidence', 'reasoning', 'warnings'],
-          },
-        },
-      },
-      required: ['decisions'],
-    },
-  },
-};
-
 const healerTool: ToolDef = {
   type: 'function',
   function: {
@@ -228,7 +195,7 @@ const healerTool: ToolDef = {
     parameters: {
       type: 'object',
       properties: {
-        action:      { type: 'string', enum: ['STAY', 'CLOSE', 'REDEPLOY', 'CLAIM_FEES'] },
+        action:      { type: 'string', enum: ['STAY', 'CLOSE', 'CLAIM_FEES'] },
         reasoning:   { type: 'string', maxLength: 280 },
         urgency:     { type: 'string', enum: ['LOW', 'MEDIUM', 'HIGH'] },
         newStrategy: { type: ['string', 'null'], enum: ['spot', 'curve', 'bid_ask', null] },
@@ -240,49 +207,23 @@ const healerTool: ToolDef = {
 
 // ── Static rule blocks (cacheable) ─────────────────────────────
 
-function hunterStaticRules(): string {
-  return `You are the HUNTER agent — finding the best Meteora DLMM pools for single-sided LP.
-
-=== STRATEGIES ===
-- SPOT: uniform distribution across bins, good for trending markets with momentum
-- CURVE: concentrated at current price, good for tight sideways action, highest fees but easiest to go out-of-range
-- BID_ASK: concentrated at the edges, good for volatile pools / passive DCA
-
-=== HARD RULES ===
-- Fee/TVL lower than 5% → SKIP (not enough fee revenue to justify IL risk)
-- Fee/TVL between 5% and 60% → good range, DEPLOY if Nova score is high
-- Fee/TVL above 60% → consider DEPLOY but check if pool is too volatile (high ratio = high risk)
-- Nova score < 50 → SKIP
-- Bundle % > 40% → SKIP (supply manipulation)
-- Risk HIGH → only deploy if confidence > 0.85 and there's a relevant lesson
-- Max deploy per position = min(${config.maxPositionSol} SOL, 20% of total capital)
-- Prefer fresh pools with active trading over stale ones
-
-Output via tool call \`submit_deploy_decisions\`. The order of decisions MUST match the order of CANDIDATE blocks in the user message.`;
-}
-
 function healerStaticRules(): string {
   return `You are the HEALER agent — managing active DLMM LP positions.
 
 === DECISIONS ===
 - STAY: position is healthy, let it keep earning
 - CLAIM_FEES: harvest accrued fees but keep holding the position
-- CLOSE: close the position (stop loss / take profit / pool death / churning)
-- REDEPLOY: close and re-deploy to a new range (only when pool is still healthy)
+- CLOSE: close the position (stop loss / take profit / pool death / out of range too long)
 
 === HARD RULES ===
 - PnL below -${(config.stopLossPct * 100).toFixed(0)} percent (includes IL) → CLOSE (stop loss)
 - PnL above +${(config.takeProfitPct * 100).toFixed(0)} percent → CLOSE (take profit)
-
-REDEPLOY is expensive — every redeploy realizes IL plus pays slippage twice. Use it sparingly:
-- Out of range more than 2 hours AND PnL above -5 percent AND Fee/TVL above 8 percent → REDEPLOY to a new range around the current price
-- Out of range more than 2 hours AND (PnL at or below -5 percent OR Fee/TVL at or below 8 percent) → CLOSE (do not redeploy a losing or dying pool — cut losses)
-- Pool already redeployed 1 or more times in last 24 hours → CLOSE rather than REDEPLOY again (the pool is churning — repeated redeploys compound IL)
+- Out of range more than 4 hours → CLOSE (pool has shifted, cut losses)
 
 Realizable value vs mid-price PnL:
 - Two PnL numbers are shown: PnL at mid-price (optimistic) and PnL after close slippage (realistic)
 - If close slippage is above ${(config.maxCloseSlippagePct * 100).toFixed(0)} percent AND mid-price PnL is above the stop-loss threshold → STAY (selling now would crystallize MORE loss than the position is currently down — wait for liquidity to return)
-- For CLOSE / REDEPLOY decisions, weight the realistic PnL more than mid-price PnL
+- For CLOSE decisions, weight the realistic PnL more than mid-price PnL
 
 Fee/TVL guidance (values are percent — compare directly, e.g. 76.89 means 76.89%):
 - Fee/TVL below 2 percent while in-range → consider CLOSE (pool dying)
@@ -292,95 +233,9 @@ Fee/TVL guidance (values are percent — compare directly, e.g. 76.89 means 76.8
 Other:
 - Fees above 0.01 SOL accumulated and in-range → CLAIM_FEES then STAY
 - Position open less than 1 hour → bias toward STAY unless stop-loss triggers
+- Position open more than 168 hours (7 days) → bias toward CLOSE (rotate capital)
 
 Output via tool call \`submit_heal_decision\`.`;
-}
-
-// ── HUNTER ─────────────────────────────────────────────────────
-
-export async function askHunterBatch(
-  candidates: PoolCandidate[],
-  openCount:  number,
-  solBalance: number,
-): Promise<DeployDecision[]> {
-  if (candidates.length === 0) return [];
-
-  const lessons = getLessons('HUNTER', 8);
-  const perf    = buildPerformanceMemory();
-
-  // Static prefix gets cache_control — same across all hunter cycles
-  // within the 5-min ephemeral TTL window.
-  const systemBlocks: ContentBlock[] = [
-    { type: 'text', text: hunterStaticRules(), cache_control: { type: 'ephemeral' } },
-  ];
-
-  const userBlocks: ContentBlock[] = [
-    {
-      type: 'text',
-      text:
-`=== PORTFOLIO ===
-Open Positions : ${openCount}/${config.maxPositions}
-SOL Balance    : ${solBalance.toFixed(4)} SOL
-Max per pos    : ${config.maxPositionSol} SOL
-
-=== HISTORICAL PERFORMANCE ===
-Total closed   : ${perf.stats?.total ?? 0} | Win rate: ${perf.winRatePct}%
-Avg fee APR    : ${perf.stats?.avg_fee_apr ?? 0}%
-Recent:
-${perf.recentTrades}
-
-=== LESSONS FROM PAST TRADES ===
-${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'No lessons yet.'}
-
-${candidates.map((c, i) => `
-=== CANDIDATE ${i + 1} ===
-Symbol         : ${c.tokenSymbol}
-Nova Score     : ${c.novaScore.toFixed(1)}/100
-Risk Level     : ${c.riskLevel}
-Pool Address   : ${c.poolAddress}
-Fee/TVL Ratio  : ${(c.feeTvlRatio).toFixed(2)}% (daily — HIGHER = MORE fees for LP)
-Volume 24h     : $${c.volume24hUsd.toLocaleString()}
-TVL            : $${c.tvlUsd.toLocaleString()}
-Organic Score  : ${c.organicScore.toFixed(0)}/100
-Holders        : ${c.holderCount.toLocaleString()}
-Market Cap     : $${c.mcapUsd.toLocaleString()}
-Bin Step       : ${c.binStep}
-Price Change 24h: ${c.priceChange24h.toFixed(2)}%
-Whale Present  : ${c.whalePresent ? 'YES' : 'No'}
-KOL Present    : ${c.kolPresent ? 'YES' : 'No'}
-Bundle %       : ${c.bundlePct.toFixed(1)}%
-`).join('')}`,
-    },
-  ];
-
-  const { toolArgs } = await llmCall({
-    model:        config.hunterModel,
-    systemBlocks,
-    userBlocks,
-    tools:        [hunterTool],
-    toolChoice:   hunterTool.function.name,
-    maxTokens:    1500,
-  });
-
-  const decisions = (toolArgs?.decisions ?? []) as DeployDecision[];
-  if (!Array.isArray(decisions) || decisions.length === 0) {
-    logger.error('Hunter LLM returned no decisions', { toolArgs });
-    return candidates.map(() => ({
-      action: 'SKIP', strategy: 'spot', solAmount: 0, binRange: config.binRange,
-      confidence: 0, reasoning: 'LLM returned no decisions', learnedFrom: null, warnings: [],
-    }));
-  }
-
-  for (let i = 0; i < decisions.length && i < candidates.length; i++) {
-    logger.info('Hunter LLM decision', {
-      symbol:     candidates[i].tokenSymbol,
-      action:     decisions[i].action,
-      confidence: decisions[i].confidence,
-      strategy:   decisions[i].strategy,
-    });
-  }
-
-  return decisions;
 }
 
 // ── HEALER ─────────────────────────────────────────────────────
@@ -396,18 +251,7 @@ export async function askHealer(position: any, liveData: {
   currentTvl:         number;
   currentVolume:      number;
   feeTvlRatio:        number;
-  redeployCount24h?:  number;
-  poolDecay?: {
-    organicScoreEntry: number | null;
-    organicScoreNow:   number;
-    holdersEntry:      number | null;
-    holdersNow:        number;
-    feeTvlEntry:       number | null;
-    feeTvlNow:         number;
-  };
 }): Promise<HealDecision> {
-
-  const lessons = getLessons('HEALER', 6);
 
   const systemBlocks: ContentBlock[] = [
     { type: 'text', text: healerStaticRules(), cache_control: { type: 'ephemeral' } },
@@ -437,16 +281,7 @@ Current price     : ${liveData.currentPrice.toFixed(8)}
 Current TVL  : $${liveData.currentTvl.toLocaleString()}
 Volume 24h   : $${liveData.currentVolume.toLocaleString()}
 Fee/TVL ratio: ${(liveData.feeTvlRatio).toFixed(2)} percent
-Redeploys 24h: ${liveData.redeployCount24h ?? 0} (this pool, last 24 hours)
-${liveData.poolDecay ? `
-=== POOL DECAY (entry → now) ===
-Organic score: ${liveData.poolDecay.organicScoreEntry ?? '?'} → ${liveData.poolDecay.organicScoreNow.toFixed(0)}
-Holders      : ${liveData.poolDecay.holdersEntry ?? '?'} → ${liveData.poolDecay.holdersNow}
-Fee/TVL      : ${liveData.poolDecay.feeTvlEntry?.toFixed(2) ?? '?'} → ${liveData.poolDecay.feeTvlNow.toFixed(2)} percent
-(Significant decay = pool dying — bias toward CLOSE)
-` : ''}
-=== LESSONS ===
-${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'No lessons yet.'}`,
+`,
     },
   ];
 
@@ -465,52 +300,4 @@ ${lessons.length > 0 ? lessons.map((l, i) => `${i + 1}. ${l}`).join('\n') : 'No 
   }
 
   return toolArgs as unknown as HealDecision;
-}
-
-// ── deriveLesson ───────────────────────────────────────────────
-
-export async function deriveLesson(position: any): Promise<string> {
-  const systemBlocks: ContentBlock[] = [
-    {
-      type: 'text',
-      text:
-`You are the lesson-distiller. Analyze ONE closed LP position and write ONE sentence of actionable guidance for the agent's future decisions.
-
-Required format: "If [concrete condition], then [specific action] because [reason/mechanism]"
-
-Rules:
-- One sentence only, max 200 characters
-- Condition must be measurable (specific numbers from the data, not vague)
-- Action must be actionable (DEPLOY/SKIP/CLOSE/REDEPLOY/sizing/strategy)
-- No preamble, no quotes, no JSON — reply with the lesson sentence directly`,
-      cache_control: { type: 'ephemeral' },
-    },
-  ];
-
-  const userBlocks: ContentBlock[] = [
-    {
-      type: 'text',
-      text:
-`Token        : ${position.token_symbol}
-Strategy     : ${position.strategy}
-PnL          : ${position.pnl_pct?.toFixed(2)}%
-Fee APR      : ${position.fee_apr_pct?.toFixed(1)}%
-Exit reason  : ${position.exit_reason}
-Time in range: ${position.time_in_range_pct?.toFixed(1)}%
-Fee/TVL entry: ${(position.fee_tvl_ratio * 100)?.toFixed(2)}%
-Holders      : ${position.holder_count}
-Whale present: ${position.whale_present ? 'yes' : 'no'}
-Bundle %     : ${position.bundle_pct?.toFixed(1) ?? '?'}%
-TVL entry    : $${position.tvl_usd?.toLocaleString() ?? '?'}`,
-    },
-  ];
-
-  const { text } = await llmCall({
-    model:     config.lessonModel,
-    systemBlocks,
-    userBlocks,
-    maxTokens: 200,
-  });
-
-  return text.trim().replace(/^["']|["']$/g, '');
 }

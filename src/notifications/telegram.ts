@@ -122,7 +122,7 @@ export async function sendDailyReport(): Promise<void> {
       ROUND(SUM(fees_claimed_sol),6) as fees,
       ROUND(AVG(fee_apr_pct),1) as avg_apr
     FROM positions
-    WHERE status='closed' AND date(closed_at/1000,'unixepoch') = ?
+    WHERE status='closed' AND date(closed_at/1000,'unixepoch','utc') = ?
   `).get(today) as any;
 
   const openPos  = getOpenPositions();
@@ -146,7 +146,7 @@ export async function sendDailyReport(): Promise<void> {
 
 // ── Commands ───────────────────────────────────────────────────
 
-export function setupCommands(agentState: { isRunning: boolean }): void {
+export function setupCommands(agentState: { isRunning: boolean; closeAll?: boolean }): void {
   const polBot = new TelegramBot(config.telegramToken, { polling: true });
   const guard  = (msg: TelegramBot.Message) =>
     msg.chat.id.toString() === config.telegramChatId;
@@ -239,9 +239,14 @@ export function setupCommands(agentState: { isRunning: boolean }): void {
 
   polBot.onText(/\/closeall/, async (msg) => {
     if (!guard(msg)) return;
-    await polBot.sendMessage(msg.chat.id, '⚠️ Closing all positions...');
-    // Signal handled by main loop
+    const positions = getOpenPositions();
+    if (positions.length === 0) {
+      await polBot.sendMessage(msg.chat.id, 'No open positions.');
+      return;
+    }
+    await polBot.sendMessage(msg.chat.id, `Closing ${positions.length} positions...`);
     agentState.isRunning = false;
+    agentState.closeAll = true;
   });
 
   logger.info('Telegram commands: /status /positions /stop /start /report /closeall');
