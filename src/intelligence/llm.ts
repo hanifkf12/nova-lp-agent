@@ -285,7 +285,7 @@ Fee/TVL ratio: ${(liveData.feeTvlRatio).toFixed(2)} percent
     },
   ];
 
-  const { toolArgs } = await llmCall({
+  const { text, toolArgs } = await llmCall({
     model:      config.healerModel,
     systemBlocks,
     userBlocks,
@@ -294,10 +294,20 @@ Fee/TVL ratio: ${(liveData.feeTvlRatio).toFixed(2)} percent
     maxTokens:  400,
   });
 
-  if (!toolArgs) {
-    logger.error('Healer LLM returned no tool call');
-    return { action: 'STAY', reasoning: 'LLM no decision — defaulting STAY', urgency: 'LOW', newStrategy: null };
+  // If tool call returned, use it directly
+  if (toolArgs) {
+    return toolArgs as unknown as HealDecision;
   }
 
-  return toolArgs as unknown as HealDecision;
+  // Fallback: parse text response for keywords (models without tool support)
+  const upper = text.toUpperCase();
+  if (upper.includes('CLOSE')) {
+    return { action: 'CLOSE', reasoning: text.slice(0, 280), urgency: 'MEDIUM', newStrategy: null };
+  }
+  if (upper.includes('CLAIM')) {
+    return { action: 'CLAIM_FEES', reasoning: text.slice(0, 280), urgency: 'LOW', newStrategy: null };
+  }
+
+  logger.warn('Healer LLM returned no tool call, defaulting STAY', { text: text.slice(0, 100) });
+  return { action: 'STAY', reasoning: 'LLM no decision — defaulting STAY', urgency: 'LOW', newStrategy: null };
 }
