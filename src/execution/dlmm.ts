@@ -506,13 +506,17 @@ function computeDLMMIL(
     const binPriceAtEntry = lowerPrice * Math.pow(upperPrice / lowerPrice, frac);
 
     if (currentPrice >= binPriceAtEntry) {
-      // Price above bin → bin holds SOL (Y). Full value = deployed amount.
-      totalValueSol = totalValueSol.add(deployedLamports);
-    } else {
-      // Price below bin → all SOL was converted to token X at binPriceAtEntry.
-      // Token X amount = SOL_deployed / binPriceAtEntry (in SOL per token terms)
-      const tokensFromBin = deployedLamports.div(new Decimal(binPriceAtEntry));
+      // Price above bin → bin was crossed, SOL converted to token X.
+      // Token X amount = SOL_deployed / binPriceAtEntry.
+      // deployedLamports is in lamports, binPriceAtEntry is in SOL/token.
+      // Convert lamports to SOL first, then divide by price to get token units.
+      const solInBin = deployedLamports.div(new Decimal(1e9));
+      const tokensFromBin = solInBin.div(new Decimal(binPriceAtEntry));
       totalTokensX = totalTokensX.add(tokensFromBin);
+    } else {
+      // Price below bin → bin not yet crossed, still holds SOL (Y).
+      const solInBin = deployedLamports.div(new Decimal(1e9));
+      totalValueSol = totalValueSol.add(solInBin);
     }
   }
 
@@ -526,7 +530,7 @@ function computeDLMMIL(
   return {
     positionValueSol: positionValueSolNum,
     ilSol: ilSolNum,
-    tokenQty: Number(totalTokensX),
+    tokenQty: Number(totalTokensX), // actual token units (not lamports)
   };
 }
 
@@ -783,6 +787,7 @@ export async function getLivePositionData(
 
     // Fee accrual: fee_tvl_ratio from Meteora is annualized (APR-equivalent).
     // Convert to daily yield: divide by 365. Cap at 0.5% daily (182.5% APR).
+    // Meteora formula: LP_fee = trading_fee * (1 - protocol_share/10000) * (yourLiquidity / totalLiquidity)
     const stateKey = `dry_pos:${pos.id}`;
     const rawState = getState(stateKey);
     const state    = rawState
@@ -793,12 +798,18 @@ export async function getLivePositionData(
     if (isInRange) {
       let dailyYield: number;
       if (snapFeeTvl > 0) {
-        // snapFeeTvl is annualized percent (e.g. 12.5 = 12.5% APR)
+        // snapFeeTvl is annualized percent (e.g. 19.32 = 1932% APR)
+        // Daily yield = feeTvlRatio / 100 / 365
         dailyYield = Math.min(snapFeeTvl / 100 / 365, 0.005);
       } else {
         dailyYield = 0;
       }
-      state.pendingFees += solDeployed * dailyYield * (deltaSec / 86400);
+      // Protocol fee is 10% (standard pool). LP gets 90%.
+      const protocolFeeFactor = 0.90;
+      // Our share of pool liquidity (approximate: solDeployed / poolTvl)
+      const poolShare = snapTvl > 0 ? Math.min(solDeployed / snapTvl, 1) : 1;
+      // Our daily fee = dailyYield * solDeployed * protocolFeeFactor * poolShare
+      state.pendingFees += solDeployed * dailyYield * protocolFeeFactor * poolShare * (deltaSec / 86400);
     }
     state.lastTickAt = now;
     setState(stateKey, JSON.stringify(state));
