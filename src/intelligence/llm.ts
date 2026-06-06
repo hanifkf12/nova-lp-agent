@@ -225,10 +225,10 @@ Realizable value vs mid-price PnL:
 - If close slippage is above ${(config.maxCloseSlippagePct * 100).toFixed(0)} percent AND mid-price PnL is above the stop-loss threshold → STAY (selling now would crystallize MORE loss than the position is currently down — wait for liquidity to return)
 - For CLOSE decisions, weight the realistic PnL more than mid-price PnL
 
-Fee/TVL guidance (values are percent — compare directly, e.g. 76.89 means 76.89%):
-- Fee/TVL below 2 percent while in-range → consider CLOSE (pool dying)
-- Fee/TVL between 2 and 10 percent → acceptable but not great, STAY only if PnL positive
-- Fee/TVL above 10 percent → good fee generation, bias toward STAY
+Fee/TVL guidance (normalize annualized fee/TVL to daily by dividing by 365 before comparing):
+- Daily Fee/TVL below 2 percent while in-range → consider CLOSE (pool dying)
+- Daily Fee/TVL between 2 and 10 percent → acceptable but not great, STAY only if PnL positive
+- Daily Fee/TVL above 10 percent → good fee generation, bias toward STAY
 
 Other:
 - Fees above 0.01 SOL accumulated and in-range → CLAIM_FEES then STAY
@@ -280,7 +280,7 @@ Current price     : ${liveData.currentPrice.toFixed(8)}
 === POOL HEALTH ===
 Current TVL  : $${liveData.currentTvl.toLocaleString()}
 Volume 24h   : $${liveData.currentVolume.toLocaleString()}
-Fee/TVL ratio: ${(liveData.feeTvlRatio).toFixed(2)} percent
+Fee/TVL ratio: ${(liveData.feeTvlRatio / 365 * 100).toFixed(2)} percent (daily, normalized from annualized ${liveData.feeTvlRatio.toFixed(0)}%)
 `,
     },
   ];

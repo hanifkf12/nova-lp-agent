@@ -776,12 +776,9 @@ export async function getLivePositionData(
     let snapTvl = pos.tvl_usd ?? 0;
     let snapVolume = pos.volume_24h_usd ?? 0;
     let snapFeeTvl = pos.fee_tvl_ratio ?? 0;
-    let liveFeeRate: number | null = null;
-
     const poolHealth = await getLivePoolHealth(poolAddress);
     if (poolHealth && poolHealth.currentTvl > 0) {
       snapTvl = poolHealth.currentTvl;
-      liveFeeRate = poolHealth.currentFeeRate;
     }
 
     // Fee accrual: fee_tvl_ratio from Meteora is annualized (APR-equivalent).
@@ -795,10 +792,7 @@ export async function getLivePositionData(
     const deltaSec = Math.max(0, (now - state.lastTickAt) / 1000);
     if (isInRange) {
       let dailyYield: number;
-      if (liveFeeRate !== null && liveFeeRate > 0) {
-        // liveFeeRate is dynamic fee in bps → convert to annualized daily
-        dailyYield = Math.min(liveFeeRate / 10000 / 365, 0.005);
-      } else if (snapFeeTvl > 0) {
+      if (snapFeeTvl > 0) {
         // snapFeeTvl is annualized percent (e.g. 12.5 = 12.5% APR)
         dailyYield = Math.min(snapFeeTvl / 100 / 365, 0.005);
       } else {

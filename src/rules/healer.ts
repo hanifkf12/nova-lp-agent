@@ -34,9 +34,10 @@ export function hardRuleDecision(input: HealerInput): HealDecision | null {
     return { action: 'CLOSE', reasoning: `OOR ${input.hoursOpen.toFixed(0)}h — pool shifted`, urgency: 'MEDIUM', newStrategy: null };
   }
 
-  // Pool dying while in range
-  if (input.isInRange && input.feeTvlRatio < 0.02) {
-    return { action: 'CLOSE', reasoning: `pool dying: fee/TVL ${(input.feeTvlRatio * 100).toFixed(1)}%`, urgency: 'MEDIUM', newStrategy: null };
+  // Pool dying while in range — feeTvlRatio is annualized APR, normalize to daily
+  const dailyFeeTvl = (input.feeTvlRatio ?? 0) / 365;
+  if (input.isInRange && dailyFeeTvl < 0.02) {
+    return { action: 'CLOSE', reasoning: `pool dying: daily fee/TVL ${(dailyFeeTvl * 100).toFixed(1)}%`, urgency: 'MEDIUM', newStrategy: null };
   }
 
   // Max age — close stale positions
