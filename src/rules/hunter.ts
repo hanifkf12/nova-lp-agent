@@ -5,11 +5,16 @@ import { isPoolOnCooldown } from '../db';
 import { logger } from '../utils/logger';
 
 export function chooseStrategy(pool: PoolCandidate): 'spot' | 'curve' | 'bid_ask' {
-  if (pool.priceChange24h > 30) return 'bid_ask';
-  // feeTvlRatio from Meteora is annualized APR (e.g., 24 = 2400%)
-  // Normalize to daily ratio for strategy selection
+  // Meme coins are volatile — use Bid-Ask for higher price swings
+  // Bid-Ask places more liquidity at edges, good for DCA-style entry/exit
+  if (pool.priceChange24h > 15) return 'bid_ask';
+
+  // Curve concentrates liquidity at center — high fee capture for stable pools
+  // Threshold: 5% daily fee/TVL = 1825% APR (reachable for high-fee pools)
   const dailyFeeTvl = (pool.feeTvlRatio ?? 0) / 365;
-  if (dailyFeeTvl > 0.25) return 'curve';
+  if (dailyFeeTvl > 0.05) return 'curve';
+
+  // Spot = uniform distribution — default for most meme coin pools
   return 'spot';
 }
 

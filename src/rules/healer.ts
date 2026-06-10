@@ -35,8 +35,9 @@ export function hardRuleDecision(input: HealerInput): HealDecision | null {
   }
 
   // Pool dying while in range — feeTvlRatio is annualized APR, normalize to daily
+  // Threshold: 0.5% daily = 182.5% APR (pools below this are not worth holding)
   const dailyFeeTvl = (input.feeTvlRatio ?? 0) / 365;
-  if (input.isInRange && dailyFeeTvl < 0.02) {
+  if (input.isInRange && dailyFeeTvl < 0.005) {
     return { action: 'CLOSE', reasoning: `pool dying: daily fee/TVL ${(dailyFeeTvl * 100).toFixed(1)}%`, urgency: 'MEDIUM', newStrategy: null };
   }
 

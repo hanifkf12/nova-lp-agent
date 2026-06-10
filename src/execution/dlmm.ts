@@ -501,21 +501,26 @@ function computeDLMMIL(
   const lowerPrice = priceRangeMin;
   const upperPrice = priceRangeMax;
 
+  // Single-sided SOL deployment: all bins start with SOL.
+  // Bins get converted to token X only when price drops THROUGH them.
+  // If currentPrice >= entryPrice: no bins crossed, all SOL.
+  // If currentPrice < entryPrice: bins between currentPrice and entryPrice crossed → hold tokens.
+
   for (let i = 0; i < binCount; i++) {
     const frac = i / (binCount - 1);
     const binPriceAtEntry = lowerPrice * Math.pow(upperPrice / lowerPrice, frac);
 
-    if (currentPrice >= binPriceAtEntry) {
-      // Price above bin → bin was crossed, SOL converted to token X.
-      // Token X amount = SOL_deployed / binPriceAtEntry.
-      // deployedLamports is in lamports, binPriceAtEntry is in SOL/token.
-      // Convert lamports to SOL first, then divide by price to get token units.
-      const solInBin = deployedLamports.div(new Decimal(1e9));
+    // Bin was crossed if its price is ABOVE currentPrice (price dropped below it)
+    // AND its price is AT OR BELOW entryPrice (it was in range at deployment)
+    const binCrossed = binPriceAtEntry > currentPrice && binPriceAtEntry <= entryPrice;
+
+    const solInBin = deployedLamports.div(new Decimal(1e9));
+    if (binCrossed) {
+      // Bin crossed: SOL converted to token X at the bin's price
       const tokensFromBin = solInBin.div(new Decimal(binPriceAtEntry));
       totalTokensX = totalTokensX.add(tokensFromBin);
     } else {
-      // Price below bin → bin not yet crossed, still holds SOL (Y).
-      const solInBin = deployedLamports.div(new Decimal(1e9));
+      // Bin not crossed: still holds SOL
       totalValueSol = totalValueSol.add(solInBin);
     }
   }
@@ -524,7 +529,7 @@ function computeDLMMIL(
   const tokenValueSol = totalTokensX.mul(new Decimal(currentPrice));
   totalValueSol = totalValueSol.add(tokenValueSol);
 
-  const positionValueSolNum = Number(totalValueSol.div(1e9));
+  const positionValueSolNum = Number(totalValueSol); // already in SOL (lamports/1e9 done in loop)
   const ilSolNum = Math.max(0, solDeployed - positionValueSolNum);
 
   return {

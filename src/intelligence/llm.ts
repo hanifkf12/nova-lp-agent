@@ -226,9 +226,9 @@ Realizable value vs mid-price PnL:
 - For CLOSE decisions, weight the realistic PnL more than mid-price PnL
 
 Fee/TVL guidance (normalize annualized fee/TVL to daily by dividing by 365 before comparing):
-- Daily Fee/TVL below 2 percent while in-range → consider CLOSE (pool dying)
-- Daily Fee/TVL between 2 and 10 percent → acceptable but not great, STAY only if PnL positive
-- Daily Fee/TVL above 10 percent → good fee generation, bias toward STAY
+- Daily Fee/TVL below 0.5 percent while in-range → consider CLOSE (pool dying)
+- Daily Fee/TVL between 0.5 and 5 percent → acceptable, STAY only if PnL positive
+- Daily Fee/TVL above 5 percent → good fee generation, bias toward STAY
 
 Other:
 - Fees above 0.01 SOL accumulated and in-range → CLAIM_FEES then STAY
